@@ -11,10 +11,10 @@ import org.springframework.scheduling.annotation.EnableAsync;
 @EnableAspectJAutoProxy(exposeProxy = true)
 @EnableAsync
 
-public class YuPictureBackendTryApplication {
+public class PictureBackendProApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(YuPictureBackendTryApplication.class, args);
+        SpringApplication.run(PictureBackendProApplication.class, args);
     }
 
 }
