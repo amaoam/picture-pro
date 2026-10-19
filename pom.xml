@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.zmt</groupId>
-    <artifactId>yu-picture-backend-try</artifactId>
+    <artifactId>picture-backendpro</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>yu-picture-backend-try</name>
+    <name>picture-backend-pro</name>
     <description>yu-picture-backend-try</description>
 
     <properties>

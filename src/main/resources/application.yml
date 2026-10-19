@@ -65,7 +65,7 @@ knife4j:
         group-name: "默认分组"
         api-rule: package
         api-rule-resources:
-          - com.zmt.yupicturebackendtry.controller
+          - com.zmt.picturebackendpro.controller
 
 # 腾讯云 COS 对象存储配置（需自行填入密钥）
 cos:
