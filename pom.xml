@@ -14,7 +14,7 @@
     <artifactId>picture-backendpro</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>picture-backend-pro</name>
-    <description>yu-picture-backend-try</description>
+    <description>picture-backend-pro</description>
 
     <properties>
         <java.version>17</java.version>
@@ -155,6 +155,17 @@
         </dependencies>
     </dependencyManagement>
     <build>
+        <!-- 资源拷贝配置-->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <includes>
+                    <include>**/*.*</include> <!-- 允许 src/main/resources 下的所有文件打包 -->
+                </includes>
+                <filtering>false</filtering>
+            </resource>
+        </resources>
+
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
@@ -169,4 +180,5 @@
             </plugin>
         </plugins>
     </build>
+
 </project>
