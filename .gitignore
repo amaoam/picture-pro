@@ -1,0 +1,104 @@
+# ==============================
+# 1. 构建输出目录
+# ==============================
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# ==============================
+# 2. Maven 相关
+# ==============================
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+# 如需统一团队Maven版本，建议保留提交 mvnw、mvnw.cmd 和 .mvn/wrapper/maven-wrapper.properties
+mvnw
+mvnw.cmd
+
+# ==============================
+# 3. IDE 配置文件
+# ==============================
+
+### IntelliJ IDEA ###
+.idea/
+*.iws
+*.iml
+*.ipr
+
+### Eclipse / Spring Tool Suite (STS) ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### VS Code（不用可删除）###
+.vscode/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# ==============================
+# 4. 系统临时文件
+# ==============================
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==============================
+# 5. 日志与临时文件
+# ==============================
+*.log
+*.log.*
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ==============================
+# 6. 测试与覆盖率报告
+# ==============================
+jacoco.exec
+*.exec
+.coverage
+cobertura.ser
+/surefire-reports/
+/failsafe-reports/
+
+# ==============================
+# 7. Spring Boot 特定
+# ==============================
+# Spring 配置处理器生成的元数据
+META-INF/spring-configuration-metadata.json
+# 堆转储、运行时错误日志
+heapdump*
+hs_err_pid*
+*.pid
+*.seed
+*.cid
+
+# ==============================
+# 8. 环境配置文件（推荐做法）
+# ==============================
+# 敏感信息（数据库密码、密钥等）请放在 application-local.yml 中
+application-local.yml
+application-local.properties
+# 如确实需要强制忽略主配置，再解开下面这行（非常不推荐）
+# src/main/resources/application.yml
