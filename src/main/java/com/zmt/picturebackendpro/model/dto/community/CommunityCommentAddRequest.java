@@ -9,7 +9,6 @@ import java.io.Serializable;
  */
 @Data
 public class CommunityCommentAddRequest implements Serializable {
-    private Long postId;
     /** 为空表示顶层评论；有值时只能回复顶层评论，暂不支持无限层级。 */
     private Long parentId;
     private String content;

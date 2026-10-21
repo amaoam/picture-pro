@@ -11,10 +11,7 @@ import com.zmt.picturebackendpro.model.dto.community.CommunityPostQueryRequest;
 import com.zmt.picturebackendpro.model.entity.*;
 import com.zmt.picturebackendpro.model.vo.community.CommunityImageVO;
 import com.zmt.picturebackendpro.model.vo.community.CommunityPostVO;
-import com.zmt.picturebackendpro.service.CommunityPostService;
-import com.zmt.picturebackendpro.service.SpaceService;
-import com.zmt.picturebackendpro.service.SpaceUserService;
-import com.zmt.picturebackendpro.service.UserService;
+import com.zmt.picturebackendpro.service.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -45,6 +42,8 @@ public class CommunityPostServiceImpl implements CommunityPostService {
     @Resource
     private CommunityPostMapper communityPostMapper;
     @Resource
+    private CommunityExperienceService communityExperienceService;
+    @Resource
     private CommunityPostImageMapper communityPostImageMapper;
     @Resource
     private CommunityPostTagMapper communityPostTagMapper;
@@ -62,6 +61,7 @@ public class CommunityPostServiceImpl implements CommunityPostService {
     private SpaceUserService spaceUserService;
     @Resource
     private UserService userService;
+    
 
     @Override
     @Transactional(rollbackFor = Exception.class)
