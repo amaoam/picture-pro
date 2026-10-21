@@ -14,7 +14,7 @@ import java.util.Date;
 @Data
 @TableName("user_community_profile")
 public class UserCommunityProfile implements Serializable {
-    
+    @TableId(value = "userId", type = IdType.INPUT)
     private Long userId;
     /**
      * 当前累计经验值

@@ -9,7 +9,7 @@ import java.io.Serializable;
 import java.util.Date;
 
 /**
- * community_post_like 对应的社区业务实体。 社区点赞
+ * community_post_like 对应的社区业务实体。 帖子用户点赞记录
  * 字段名与 community_feature.sql 保持一致。
  */
 @Data
