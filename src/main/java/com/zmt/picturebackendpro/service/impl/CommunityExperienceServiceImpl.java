@@ -8,7 +8,7 @@ import com.zmt.picturebackendpro.mapper.UserExpRecordMapper;
 import com.zmt.picturebackendpro.model.entity.User;
 import com.zmt.picturebackendpro.model.entity.UserCommunityProfile;
 import com.zmt.picturebackendpro.model.entity.UserExpRecord;
-import com.zmt.picturebackendpro.model.vo.UserCommunityProfileVO;
+import com.zmt.picturebackendpro.model.vo.community.UserCommunityProfileVO;
 import com.zmt.picturebackendpro.service.CommunityExperienceService;
 import com.zmt.picturebackendpro.service.UserService;
 import org.springframework.beans.factory.annotation.Value;
@@ -129,7 +129,7 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
         //懂了 点赞规则是 第一次点赞之后创建点赞记录 之后取消也不会删 然后经验也是增加的 取消也不会再扣经验了
         profile.setReceivedLikeCount(valueOrZero(profile.getReceivedLikeCount()) + 1L);
         String eventKey = "POST_RECEIVED_LIKE:" + postId + ":" + likerId;
-        //检验是否用户已经点赞过
+        //检验是否用户已经有过点赞记录
         if (findRecord(eventKey) != null) {
             saveProfile(profile);
             return;

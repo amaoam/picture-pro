@@ -1,4 +1,4 @@
-package com.zmt.picturebackendpro.model.vo;
+package com.zmt.picturebackendpro.model.vo.community;
 
 import lombok.Data;
 
@@ -14,6 +14,10 @@ public class CommunityCommentVO implements Serializable {
     private String userAvatar;
     private Integer userLevel;
     private Long parentId;
+    private Integer level;
+    private Long rootId;
+    /** 一级评论的有效回复数；回复记录自身为 0。 */
+    private Long replyCount;
     private Long replyToUserId;
     private String replyToUserName;
     private String content;

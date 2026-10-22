@@ -1,7 +1,7 @@
 package com.zmt.picturebackendpro.service;
 
 
-import com.zmt.picturebackendpro.model.vo.UserCommunityProfileVO;
+import com.zmt.picturebackendpro.model.vo.community.UserCommunityProfileVO;
 
 public interface CommunityExperienceService {
     void recordPostPublished(Long postId, Long authorId);

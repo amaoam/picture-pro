@@ -8,8 +8,8 @@ import com.zmt.picturebackendpro.exception.ErrorCode;
 import com.zmt.picturebackendpro.model.dto.community.CommunityCommentAddRequest;
 import com.zmt.picturebackendpro.model.dto.community.CommunityCommentQueryRequest;
 import com.zmt.picturebackendpro.model.entity.User;
-import com.zmt.picturebackendpro.model.vo.CommunityCommentVO;
-import com.zmt.picturebackendpro.model.vo.CommunityLikeStatusVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityCommentVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityLikeStatusVO;
 import com.zmt.picturebackendpro.service.CommunityInteractionService;
 import com.zmt.picturebackendpro.service.UserService;
 import org.springframework.web.bind.annotation.*;
@@ -84,7 +84,8 @@ public class CommunityInteractionController {
                 addRequest.getContent(), user));
     }
     
-    //查看帖子评论  todo 评论得弄上等级
+    //查看帖子评论  
+    /** parentId 为空查询一级评论；非空时传一级评论 ID 查询该线程的回复分页。 */
     @PostMapping("/post/{postId}/comments/page")
     public BaseResponse<Page<CommunityCommentVO>> pageComments(@PathVariable("postId") Long postId,
                                                                @RequestBody(required = false) CommunityCommentQueryRequest queryRequest) {

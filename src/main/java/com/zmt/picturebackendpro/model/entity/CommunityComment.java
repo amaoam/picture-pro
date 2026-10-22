@@ -33,6 +33,13 @@ public class CommunityComment implements Serializable {
      * 顶层评论 id；为空表示顶层评论
      */
     private Long parentId;
+
+    /** 展示层级：0 为一级评论，1 为一级评论线程内的回复。 */
+    private Integer level;
+
+    /** 所属一级评论 ID；一级评论为空，线程内回复均指向同一 rootId。 */
+    private Long rootId;
+    
     /**
      * 被回复的用户 id
      */

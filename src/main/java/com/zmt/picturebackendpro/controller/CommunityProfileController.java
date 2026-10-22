@@ -3,7 +3,7 @@ package com.zmt.picturebackendpro.controller;
 import com.zmt.picturebackendpro.common.BaseResponse;
 import com.zmt.picturebackendpro.common.ResultUtils;
 import com.zmt.picturebackendpro.model.entity.User;
-import com.zmt.picturebackendpro.model.vo.UserCommunityProfileVO;
+import com.zmt.picturebackendpro.model.vo.community.UserCommunityProfileVO;
 import com.zmt.picturebackendpro.service.CommunityExperienceService;
 import com.zmt.picturebackendpro.service.UserService;
 import org.springframework.web.bind.annotation.GetMapping;

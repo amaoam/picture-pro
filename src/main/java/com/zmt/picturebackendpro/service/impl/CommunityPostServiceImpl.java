@@ -2,6 +2,7 @@ package com.zmt.picturebackendpro.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.zmt.picturebackendpro.exception.BusinessException;
 import com.zmt.picturebackendpro.exception.ErrorCode;
@@ -98,7 +99,9 @@ public class CommunityPostServiceImpl implements CommunityPostService {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "分享帖至少需要一张图片");
         }
         if (!imageIds.isEmpty()) {
-            //验证传入的图片是否在社区中存在
+            //验证传入的图片是否在社区中存在且已经审核通过
+            //todo  这里的逻辑其实不正常 图片是现传的 那要审核通过肯定需要时间，那怎么能发帖子呢
+            //两个思路 一个就是停止审核 和帖子一起审核  还有一个就是采用AI自动审核的方式
             validateCommunityImages(imageIds, loginUser);
         }
         //限制帖子选择的标签
@@ -106,29 +109,59 @@ public class CommunityPostServiceImpl implements CommunityPostService {
         if (!tagIds.isEmpty()) {
             validateTags(tagIds);
         }
-        
         if (communityPostMapper.insert(post) != 1) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "发布帖子失败");
         }
-        //todo 这里好多for循环 之后看看要不要优化
+//        // 这里好多for循环 之后看看要不要优化
+//        for (int i = 0; i < imageIds.size(); i++) {
+//            CommunityPostImage relation = new CommunityPostImage();
+//            relation.setPostId(post.getId());
+//            relation.setCommunityImageId(imageIds.get(i));
+//            relation.setSortOrder(i);
+//            relation.setCreateTime(new Date());
+//            if (communityPostImageMapper.insert(relation) != 1) {
+//                throw new BusinessException(ErrorCode.OPERATION_ERROR, "保存帖子图片关联失败");
+//            }
+//        }
+//        for (Long tagId : tagIds) {
+//            CommunityPostTag relation = new CommunityPostTag();
+//            relation.setPostId(post.getId());
+//            relation.setTagId(tagId);
+//            relation.setCreateTime(new Date());
+//            if (communityPostTagMapper.insert(relation) != 1) {
+//                throw new BusinessException(ErrorCode.OPERATION_ERROR, "保存帖子标签关联失败");
+//            }
+//        }
+        // 图片和标签数量有上限；组装对象后分两次批量 INSERT，减少最多 19 次数据库往返。
+        // 关系写入仍位于当前事务中，任一批次失败都会回滚帖子及其关系。
+        Date relationTime = new Date();
+        List<CommunityPostImage> imageRelations = new ArrayList<>(imageIds.size());
         for (int i = 0; i < imageIds.size(); i++) {
             CommunityPostImage relation = new CommunityPostImage();
+            relation.setId(IdWorker.getId());
             relation.setPostId(post.getId());
             relation.setCommunityImageId(imageIds.get(i));
             relation.setSortOrder(i);
-            relation.setCreateTime(new Date());
-            if (communityPostImageMapper.insert(relation) != 1) {
-                throw new BusinessException(ErrorCode.OPERATION_ERROR, "保存帖子图片关联失败");
-            }
+            relation.setCreateTime(relationTime);
+            imageRelations.add(relation);
         }
+        if (!imageRelations.isEmpty()
+                && communityPostImageMapper.insertBatch(imageRelations) != imageRelations.size()) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "批量保存帖子图片关联失败");
+        }
+
+        List<CommunityPostTag> tagRelations = new ArrayList<>(tagIds.size());
         for (Long tagId : tagIds) {
             CommunityPostTag relation = new CommunityPostTag();
+            relation.setId(IdWorker.getId());
             relation.setPostId(post.getId());
             relation.setTagId(tagId);
-            relation.setCreateTime(new Date());
-            if (communityPostTagMapper.insert(relation) != 1) {
-                throw new BusinessException(ErrorCode.OPERATION_ERROR, "保存帖子标签关联失败");
-            }
+            relation.setCreateTime(relationTime);
+            tagRelations.add(relation);
+        }
+        if (!tagRelations.isEmpty()
+                && communityPostTagMapper.insertBatch(tagRelations) != tagRelations.size()) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "批量保存帖子标签关联失败");
         }
         // 注意：经验奖励放在后续 CommunityExperienceService 中处理；当前创建接口不直接改经验值。
         return post.getId();
@@ -304,7 +337,7 @@ public class CommunityPostServiceImpl implements CommunityPostService {
             if (keyword.length() > 100) {
                 throw new BusinessException(ErrorCode.PARAMS_ERROR, "搜索词过长");
             }
-            //todo  这里的查询效率不知道怎么样
+            //这里的查询效率不知道怎么样---当前是包含匹配；普通 B-Tree 索引通常无法优化前置通配符，数据增长后应评估全文索引。
             wrapper.and(w -> w.like(CommunityPost::getTitle, keyword).or().like(CommunityPost::getContent, keyword));
         }
         Page<CommunityPost> postPage = communityPostMapper.selectPage(new Page<>(current, size), wrapper);

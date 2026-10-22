@@ -11,7 +11,7 @@
     </parent>
 
     <groupId>com.zmt</groupId>
-    <artifactId>picture-backendpro</artifactId>
+    <artifactId>picture-backend-pro</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>picture-backend-pro</name>
     <description>picture-backend-pro</description>

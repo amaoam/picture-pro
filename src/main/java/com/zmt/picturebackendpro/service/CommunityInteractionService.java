@@ -3,8 +3,8 @@ package com.zmt.picturebackendpro.service;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.zmt.picturebackendpro.model.dto.community.CommunityCommentQueryRequest;
 import com.zmt.picturebackendpro.model.entity.User;
-import com.zmt.picturebackendpro.model.vo.CommunityCommentVO;
-import com.zmt.picturebackendpro.model.vo.CommunityLikeStatusVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityCommentVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityLikeStatusVO;
 
 
 public interface CommunityInteractionService {

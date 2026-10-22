@@ -1,4 +1,4 @@
-package com.zmt.picturebackendpro.model.vo;
+package com.zmt.picturebackendpro.model.vo.community;
 
 import lombok.Data;
 

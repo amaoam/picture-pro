@@ -8,8 +8,9 @@ import com.zmt.picturebackendpro.exception.ErrorCode;
 import com.zmt.picturebackendpro.mapper.*;
 import com.zmt.picturebackendpro.model.dto.community.CommunityCommentQueryRequest;
 import com.zmt.picturebackendpro.model.entity.*;
-import com.zmt.picturebackendpro.model.vo.CommunityCommentVO;
-import com.zmt.picturebackendpro.model.vo.CommunityLikeStatusVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityCommentReplyCountVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityCommentVO;
+import com.zmt.picturebackendpro.model.vo.community.CommunityLikeStatusVO;
 import com.zmt.picturebackendpro.service.CommunityExperienceService;
 import com.zmt.picturebackendpro.service.CommunityInteractionService;
 import com.zmt.picturebackendpro.service.UserService;
@@ -31,6 +32,8 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
     private static final int IMAGE_REVIEW_PASSED = 1;
     private static final int MAX_PAGE_SIZE = 50;
     private static final int COMMENT_NORMAL = 1;
+    private static final int COMMENT_ROOT = 0;
+    private static final int COMMENT_REPLY = 1;
 
     @Resource private CommunityPostMapper communityPostMapper;
     @Resource private CommunityPostLikeMapper communityPostLikeMapper;
@@ -50,24 +53,43 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         if (loginUser.getId().equals(post.getUserId())) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "不能给自己的帖子点赞");
         }
-        //查询是否已经有点赞记录
-        CommunityPostLike existing = findPostLike(postId, loginUser.getId());
-        if (existing == null) {
-            CommunityPostLike like = new CommunityPostLike();
-            like.setPostId(postId);
-            like.setUserId(loginUser.getId());
-            like.setCreateTime(new Date());
-            try {
-                if (communityPostLikeMapper.insert(like) == 1) {
-                    //todo 这里是采用更新数据库的方式 之后肯定要升级到高并发的场景
-                    updatePostCounter(postId, "likeCount", 1);
-                    //给帖子用户增加经验 
-                    experienceService.recordPostLikeAdded(postId, loginUser.getId(), post.getUserId());
-                }
-            } catch (DuplicateKeyException duplicateKeyException) {
-                // 并发重复点赞由唯一键兜底，不再次更新计数或经验。
-                log.debug("Duplicate post like ignored: post={}, user={}", postId, loginUser.getId());
-            }
+//        //查询是否已经有点赞记录
+//        CommunityPostLike existing = findPostLike(postId, loginUser.getId());
+//        if (existing == null) {
+//            CommunityPostLike like = new CommunityPostLike();
+//            like.setPostId(postId);
+//            like.setUserId(loginUser.getId());
+//            like.setCreateTime(new Date());
+//            try {
+//                if (communityPostLikeMapper.insert(like) == 1) {
+//                    //todo 这里是采用更新数据库的方式 之后肯定要升级到高并发的场景
+//                    updatePostCounter(postId, "likeCount", 1);
+//                    //给帖子用户增加经验 
+//                    experienceService.recordPostLikeAdded(postId, loginUser.getId(), post.getUserId());
+//                }
+//            } catch (DuplicateKeyException duplicateKeyException) {
+//                // 并发重复点赞由唯一键兜底，不再次更新计数或经验。
+//                log.debug("Duplicate post like ignored: post={}, user={}", postId, loginUser.getId());
+//            }
+//        }
+        //优化
+        CommunityPostLike like = new CommunityPostLike();
+        like.setPostId(postId);
+        like.setUserId(loginUser.getId());
+        like.setCreateTime(new Date());
+
+        // 不先查再插：uk_post_user 是并发正确性边界，避免多一次 SELECT。
+        // 只捕获 INSERT 本身的唯一键冲突，不能把后续计数或经验业务的异常误当成重复点赞。
+        boolean inserted;
+        try {
+            inserted = communityPostLikeMapper.insert(like) == 1;
+        } catch (DuplicateKeyException duplicateKeyException) {
+            log.debug("Duplicate post like ignored: post={}, user={}", postId, loginUser.getId());
+            inserted = false;
+        }
+        if (inserted) {
+            updatePostCounter(postId, "likeCount", 1, true, true);
+            experienceService.recordPostLikeAdded(postId, loginUser.getId(), post.getUserId());
         }
         //返回当前用户点赞视图
         return postStatus(postId, loginUser.getId());
@@ -80,18 +102,27 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         requireLogin(loginUser);
         //获取正确的帖子
         CommunityPost post = requirePublishedPost(postId);
-        //查询之前是否存在点赞记录
-        CommunityPostLike existing = findPostLike(postId, loginUser.getId());
-        if (existing != null) {
-            //todo  同点赞业务 需要升级到高并发场景
-            int deleted = communityPostLikeMapper.delete(new LambdaQueryWrapper<CommunityPostLike>()
-                    .eq(CommunityPostLike::getId, existing.getId())
-                    .eq(CommunityPostLike::getUserId, loginUser.getId()));
-            if (deleted > 0) {
-                updatePostCounter(postId, "likeCount", -1);
-                //去除帖子点赞数（但是不扣除之前点赞带来的经验）
-                experienceService.recordPostLikeRemoved(post.getUserId());
-            }
+//        //查询之前是否存在点赞记录
+//        CommunityPostLike existing = findPostLike(postId, loginUser.getId());
+//        if (existing != null) {
+//            //todo  同点赞业务 需要升级到高并发场景
+//            int deleted = communityPostLikeMapper.delete(new LambdaQueryWrapper<CommunityPostLike>()
+//                    .eq(CommunityPostLike::getId, existing.getId())
+//                    .eq(CommunityPostLike::getUserId, loginUser.getId()));
+//            if (deleted > 0) {
+//                updatePostCounter(postId, "likeCount", -1);
+//                //去除帖子点赞数（但是不扣除之前点赞带来的经验）
+//                experienceService.recordPostLikeRemoved(post.getUserId());
+//            }
+//        }
+        // 直接按业务键删除；受影响行数表示本次是否真的取消，省去读取点赞 ID 的查询。
+        int deleted = communityPostLikeMapper.delete(new LambdaQueryWrapper<CommunityPostLike>()
+                .eq(CommunityPostLike::getPostId, postId)
+                .eq(CommunityPostLike::getUserId, loginUser.getId()));
+        if (deleted > 0) {
+            updatePostCounter(postId, "likeCount", -1, true, true);
+            // 取消点赞减少当前获赞数，但不撤销此前的一次性经验奖励。
+            experienceService.recordPostLikeRemoved(post.getUserId());
         }
         //返回当前用户视图
         return postStatus(postId, loginUser.getId());
@@ -114,21 +145,36 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         if (picture.getUserId() != null && picture.getUserId().equals(loginUser.getId())) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "不能给自己的图片点赞");
         }
-        //查看是否已经存在点赞记录
-        PictureLike existing = findPictureLike(pictureId, loginUser.getId());
-        if (existing == null) {
-            PictureLike like = new PictureLike();
-            like.setPictureId(pictureId);
-            like.setUserId(loginUser.getId());
-            like.setCreateTime(new Date());
-            try {
-                if (pictureLikeMapper.insert(like) == 1) {
-                    //为图片所有者添加经验
-                    experienceService.recordPictureLikeAdded(pictureId, loginUser.getId(), picture.getUserId());
-                }
-            } catch (DuplicateKeyException duplicateKeyException) {
-                log.debug("Duplicate picture like ignored: picture={}, user={}", pictureId, loginUser.getId());
-            }
+//        //查看是否已经存在点赞记录
+//        PictureLike existing = findPictureLike(pictureId, loginUser.getId());
+//        if (existing == null) {
+//            PictureLike like = new PictureLike();
+//            like.setPictureId(pictureId);
+//            like.setUserId(loginUser.getId());
+//            like.setCreateTime(new Date());
+//            try {
+//                if (pictureLikeMapper.insert(like) == 1) {
+//                    //为图片所有者添加经验
+//                    experienceService.recordPictureLikeAdded(pictureId, loginUser.getId(), picture.getUserId());
+//                }
+//            } catch (DuplicateKeyException duplicateKeyException) {
+//                log.debug("Duplicate picture like ignored: picture={}, user={}", pictureId, loginUser.getId());
+//            }
+//        }
+        PictureLike like = new PictureLike();
+        like.setPictureId(pictureId);
+        like.setUserId(loginUser.getId());
+        like.setCreateTime(new Date());
+        // 与帖子点赞保持一致，只将唯一键冲突视为重复操作。
+        boolean inserted;
+        try {
+            inserted = pictureLikeMapper.insert(like) == 1;
+        } catch (DuplicateKeyException duplicateKeyException) {
+            log.debug("Duplicate picture like ignored: picture={}, user={}", pictureId, loginUser.getId());
+            inserted = false;
+        }
+        if (inserted) {
+            experienceService.recordPictureLikeAdded(pictureId, loginUser.getId(), picture.getUserId());
         }
         return pictureStatus(pictureId, loginUser.getId());
     }
@@ -139,15 +185,22 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         //对用户登录和图片状态进行检查
         requireLogin(loginUser);
         Picture picture = requirePublicPicture(pictureId);
-        PictureLike existing = findPictureLike(pictureId, loginUser.getId());
-        if (existing != null) {
-            int deleted = pictureLikeMapper.delete(new LambdaQueryWrapper<PictureLike>()
-                    .eq(PictureLike::getId, existing.getId())
-                    .eq(PictureLike::getUserId, loginUser.getId()));
-            if (deleted > 0) {
-                //图片点赞数目减一
-                experienceService.recordPictureLikeRemoved(picture.getUserId());
-            }
+//        PictureLike existing = findPictureLike(pictureId, loginUser.getId());
+//        if (existing != null) {
+//            int deleted = pictureLikeMapper.delete(new LambdaQueryWrapper<PictureLike>()
+//                    .eq(PictureLike::getId, existing.getId())
+//                    .eq(PictureLike::getUserId, loginUser.getId()));
+//            if (deleted > 0) {
+//                //图片点赞数目减一
+//                experienceService.recordPictureLikeRemoved(picture.getUserId());
+//            }
+//        }
+        // 业务键直接删除，避免先查记录 ID。点赞计数当前由 SQL COUNT 计算。
+        int deleted = pictureLikeMapper.delete(new LambdaQueryWrapper<PictureLike>()
+                .eq(PictureLike::getPictureId, pictureId)
+                .eq(PictureLike::getUserId, loginUser.getId()));
+        if (deleted > 0) {
+            experienceService.recordPictureLikeRemoved(picture.getUserId());
         }
         return pictureStatus(pictureId, loginUser.getId());
     }
@@ -164,15 +217,17 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
     public Long createComment(Long postId, Long parentId, String content, User loginUser) {
         //登录鉴权和帖子状态检查
         requireLogin(loginUser);
-        CommunityPost post = requirePublishedPost(postId);
+        requirePublishedPost(postId);
         if (!StringUtils.hasText(content) || content.trim().length() > 2000) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "评论内容不能为空且不能超过 2000 个字符");
         }
         Long replyToUserId = null;
+        Long rootId = null;
         if (parentId != null) {
             if (parentId <= 0) {
                 throw new BusinessException(ErrorCode.PARAMS_ERROR, "父评论 ID 不合法");
             }
+            // parentId 是客户端实际点击回复的评论，可以是一条一级评论，也可以是某个一级评论的回复。
             CommunityComment parent = communityCommentMapper.selectOne(new LambdaQueryWrapper<CommunityComment>()
                     .eq(CommunityComment::getId, parentId)
                     .eq(CommunityComment::getPostId, postId)
@@ -181,8 +236,28 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
             if (parent == null) {
                 throw new BusinessException(ErrorCode.PARAMS_ERROR, "父评论不存在或不可回复");
             }
-            if (parent.getParentId() != null) {
-                throw new BusinessException(ErrorCode.PARAMS_ERROR, "暂不支持超过一级的评论回复");
+            int parentLevel = resolveCommentLevel(parent);
+            if (parentLevel == COMMENT_ROOT) {
+                rootId = parent.getId();
+            } else if (parentLevel == COMMENT_REPLY) {
+                rootId = parent.getRootId();
+                if (rootId == null) {
+                    throw new BusinessException(ErrorCode.OPERATION_ERROR,
+                            "父回复缺少 rootId，请先执行评论层级迁移 SQL");
+                }
+                // 防御性校验，保证被回复的回复确实属于该帖子下的一条正常一级评论。
+                CommunityComment rootComment = communityCommentMapper.selectOne(new LambdaQueryWrapper<CommunityComment>()
+                        .eq(CommunityComment::getId, rootId)
+                        .eq(CommunityComment::getPostId, postId)
+                        .eq(CommunityComment::getLevel, COMMENT_ROOT)
+                        .isNull(CommunityComment::getParentId)
+                        .eq(CommunityComment::getIsDelete, 0)
+                        .eq(CommunityComment::getStatus, COMMENT_NORMAL));
+                if (rootComment == null) {
+                    throw new BusinessException(ErrorCode.PARAMS_ERROR, "所属一级评论不存在或不可回复");
+                }
+            } else {
+                throw new BusinessException(ErrorCode.PARAMS_ERROR, "评论层级不合法");
             }
             replyToUserId = parent.getUserId();
         }
@@ -198,9 +273,7 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         if (communityCommentMapper.insert(comment) != 1) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "发表评论失败");
         }
-        //todo 更新帖子评论数量  依旧等待升级高并发
-        updatePostCounter(postId, "commentCount", 1);
-        experienceService.recordCommentCreated(comment.getId(), postId, loginUser.getId());
+        updatePostCounter(postId, "commentCount", 1, true, true);        experienceService.recordCommentCreated(comment.getId(), postId, loginUser.getId());
         return comment.getId();
     }
 
@@ -214,14 +287,33 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         if (current < 1 || size < 1 || size > MAX_PAGE_SIZE) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "评论分页参数不合法，每页最多 50 条");
         }
-        Page<CommunityComment> commentPage = communityCommentMapper.selectPage(new Page<>(current, size),
-                new LambdaQueryWrapper<CommunityComment>()
-                        .eq(CommunityComment::getPostId, postId)
-                        .eq(CommunityComment::getStatus, COMMENT_NORMAL)
-                        .eq(CommunityComment::getIsDelete, 0)
-                        .eq(CommunityComment::getParentId,parentId)
-                        .orderByDesc(CommunityComment::getCreateTime)
-                        .orderByDesc(CommunityComment::getId));
+        LambdaQueryWrapper<CommunityComment> wrapper = new LambdaQueryWrapper<CommunityComment>()
+                .eq(CommunityComment::getPostId, postId)
+                .eq(CommunityComment::getStatus, COMMENT_NORMAL)
+                .eq(CommunityComment::getIsDelete, 0);
+        // 明确区分一级评论（parentId 为 null）与子评论
+        if (parentId == null) {
+            // 一级评论用 IS NULL 查询 parentId，SQL 里的 parentId = NULL 不会匹配空值。
+            wrapper.eq(CommunityComment::getLevel, COMMENT_ROOT)
+                    .isNull(CommunityComment::getParentId);
+        } else {
+            //回复分页参数始终要求一级评论 ID，避免把任意回复 ID 当成线程根节点。(其实这里就是校验传入的parentId是一级评论id）
+            CommunityComment rootComment = communityCommentMapper.selectOne(new LambdaQueryWrapper<CommunityComment>()
+                    .eq(CommunityComment::getId, parentId)
+                    .eq(CommunityComment::getPostId, postId)
+                    .eq(CommunityComment::getLevel, COMMENT_ROOT)
+                    .isNull(CommunityComment::getParentId)
+                    .eq(CommunityComment::getStatus, COMMENT_NORMAL)
+                    .eq(CommunityComment::getIsDelete, 0));
+            if (rootComment == null) {
+                throw new BusinessException(ErrorCode.PARAMS_ERROR, "一级评论不存在或不可查看回复");
+            }
+            wrapper.eq(CommunityComment::getLevel, COMMENT_REPLY)
+                    .eq(CommunityComment::getRootId, parentId);
+        }
+        wrapper.orderByDesc(CommunityComment::getCreateTime)
+                .orderByDesc(CommunityComment::getId);
+        Page<CommunityComment> commentPage = communityCommentMapper.selectPage(new Page<>(current, size), wrapper);
         List<CommunityCommentVO> records = fillCommentVOs(commentPage.getRecords());
         Page<CommunityCommentVO> result = new Page<>(commentPage.getCurrent(), commentPage.getSize(), commentPage.getTotal());
         result.setRecords(records);
@@ -242,25 +334,34 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         if (!loginUser.getId().equals(comment.getUserId()) && !userService.isAdmin(loginUser)) {
             throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "只能删除自己的评论");
         }
-        //todo  这个判断也有问题
-        if (comment.getParentId() == null) {
-            Long replyCount = communityCommentMapper.selectCount(new LambdaQueryWrapper<CommunityComment>()
-                    .eq(CommunityComment::getParentId, commentId)
-                    .eq(CommunityComment::getStatus, COMMENT_NORMAL)
-                    .eq(CommunityComment::getIsDelete, 0));
-            if (replyCount != null && replyCount > 0) {
-                throw new BusinessException(ErrorCode.OPERATION_ERROR, "该评论已有回复，请先删除回复");
-            }
+        //todo  这个判断 嗯 属于业务问题 就是要不要保留用户直接删除自己评论的权利
+        Long replyCount = communityCommentMapper.selectCount(new LambdaQueryWrapper<CommunityComment>()
+                .eq(CommunityComment::getParentId, commentId)
+                .eq(CommunityComment::getStatus, COMMENT_NORMAL)
+                .eq(CommunityComment::getIsDelete, 0));
+        if (replyCount != null && replyCount > 0) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "该评论已有回复，请先删除回复");
         }
+        
         int updated = communityCommentMapper.update(null, new LambdaUpdateWrapper<CommunityComment>()
                 .eq(CommunityComment::getId, commentId)
                 .eq(CommunityComment::getIsDelete, 0)
                 .set(CommunityComment::getIsDelete, 1)
                 .set(CommunityComment::getUpdateTime, new Date()));
         if (updated > 0) {
-            updatePostCounter(comment.getPostId(), "commentCount", -1);
+            // 帖子被下架后仍应允许作者/管理员清理历史评论；此时计数更新无需要求 status=已发布。
+            // 如果帖子已经逻辑删除，不让计数器更新失败回滚评论删除。
+            updatePostCounter(comment.getPostId(), "commentCount", -1, false, false);
             experienceService.recordCommentDeleted(comment.getId(), comment.getPostId(), comment.getUserId());
         }
+    }
+
+    /** 老数据迁移前 level 可能为空，因此查询/展示时通过 parentId 兼容判断。 */
+    private int resolveCommentLevel(CommunityComment comment) {
+        if (comment.getLevel() != null) {
+            return comment.getLevel();
+        }
+        return comment.getParentId() == null ? COMMENT_ROOT : COMMENT_REPLY;
     }
 
     private List<CommunityCommentVO> fillCommentVOs(List<CommunityComment> comments) {
@@ -280,16 +381,31 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
                         new LambdaQueryWrapper<UserCommunityProfile>().in(UserCommunityProfile::getUserId, userIds))
                 .stream().collect(Collectors.toMap(UserCommunityProfile::getUserId, profile -> profile, (a, b) -> a));
         List<CommunityCommentVO> result = new ArrayList<>();
-        //todo 依旧for循环
+        // 只为本页的一级评论批量查询回复数，避免在下面的 VO 组装循环里执行 N 次 COUNT。
+        List<Long> rootIds = comments.stream()
+                .filter(comment -> comment.getParentId() == null)
+                .map(CommunityComment::getId)
+                .filter(Objects::nonNull)
+                .toList();
+        Map<Long, Long> replyCountMap = new HashMap<>();
+        if (!rootIds.isEmpty()) {
+            for (CommunityCommentReplyCountVO countVO : communityCommentMapper.selectReplyCounts(rootIds)) {
+                replyCountMap.put(countVO.getRootId(), countVO.getReplyCount());
+            }
+        }
         for (CommunityComment comment : comments) {
             CommunityCommentVO vo = new CommunityCommentVO();
             vo.setId(comment.getId());
             vo.setPostId(comment.getPostId());
             vo.setUserId(comment.getUserId());
             vo.setParentId(comment.getParentId());
+            vo.setLevel(resolveCommentLevel(comment));
+            vo.setRootId(comment.getRootId());
+            vo.setReplyCount(replyCountMap.getOrDefault(comment.getId(), 0L));
             vo.setReplyToUserId(comment.getReplyToUserId());
             vo.setContent(comment.getContent());
             vo.setCreateTime(comment.getCreateTime());
+
             User author = userMap.get(comment.getUserId());
             if (author != null) {
                 vo.setUserName(author.getUserName());
@@ -306,27 +422,32 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         return result;
     }
 
-    private void updatePostCounter(Long postId, String counter, int delta) {
+    /**
+     * 原子维护帖子冗余计数。
+     * requirePublished=true 用于点赞/新评论； 需要帖子是已发布状态
+     * failIfMissing=false 当影响行数不为一时是否抛出异常   用于清理已逻辑删除的帖子下评论，避免计数更新失败回滚软删除。
+     */
+    private void updatePostCounter(Long postId, String counter, int delta,
+                                   boolean requirePublished, boolean failIfMissing) {
         LambdaUpdateWrapper<CommunityPost> wrapper = new LambdaUpdateWrapper<CommunityPost>()
                 .eq(CommunityPost::getId, postId)
-                .eq(CommunityPost::getIsDelete, 0)
-                .eq(CommunityPost::getStatus, POST_PUBLISHED);
+                .eq(CommunityPost::getIsDelete, 0);
+        if (requirePublished) {
+            wrapper.eq(CommunityPost::getStatus, POST_PUBLISHED);
+        }
         if ("likeCount".equals(counter)) {
-            if (delta > 0) {
-                wrapper.setSql("likeCount = COALESCE(likeCount, 0) + 1");
-            } else {
-                wrapper.setSql("likeCount = CASE WHEN COALESCE(likeCount, 0) > 0 THEN likeCount - 1 ELSE 0 END");
-            }
+            wrapper.setSql(delta > 0
+                    ? "likeCount = COALESCE(likeCount, 0) + 1"
+                    : "likeCount = CASE WHEN COALESCE(likeCount, 0) > 0 THEN likeCount - 1 ELSE 0 END");
         } else if ("commentCount".equals(counter)) {
-            if (delta > 0) {
-                wrapper.setSql("commentCount = COALESCE(commentCount, 0) + 1");
-            } else {
-                wrapper.setSql("commentCount = CASE WHEN COALESCE(commentCount, 0) > 0 THEN commentCount - 1 ELSE 0 END");
-            }
+            wrapper.setSql(delta > 0
+                    ? "commentCount = COALESCE(commentCount, 0) + 1"
+                    : "commentCount = CASE WHEN COALESCE(commentCount, 0) > 0 THEN commentCount - 1 ELSE 0 END");
         } else {
             throw new IllegalArgumentException("Unknown counter: " + counter);
         }
-        if (communityPostMapper.update(null, wrapper) != 1) {
+        int updated = communityPostMapper.update(null, wrapper);
+        if (updated != 1 && failIfMissing) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "更新帖子互动计数失败");
         }
     }

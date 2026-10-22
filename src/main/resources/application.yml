@@ -63,3 +63,14 @@ cos:
 # 阿里云 AI 配置
 aliYunAi:
   apiKey:
+  
+#社区等级配置 
+community:
+  experience:
+    post-reward: 10
+    comment-reward: 2
+    received-like-reward: 1
+    daily-post-cap: 30
+    daily-comment-cap: 20
+    level-thresholds: 0,100,300,600,1000,1500,2200,3000,4000,5500
+    zone-id: Asia/Shanghai
