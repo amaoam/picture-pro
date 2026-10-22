@@ -195,11 +195,16 @@ public class CommunityPostServiceImpl implements CommunityPostService {
                 }
             }
         }
+        Integer previousStatus = post.getStatus();
         post.setStatus(status);
         post.setEditTime(new Date());
         post.setUpdateTime(new Date());
         if (communityPostMapper.updateById(post) != 1) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "帖子审核更新失败");
+        }
+        // 仅在帖子第一次进入已发布状态时奖励，经验服务使用 eventKey 保证重复审核不重复发奖。
+        if (status == POST_PUBLISHED && (previousStatus == null || previousStatus != POST_PUBLISHED)) {
+            communityExperienceService.recordPostPublished(post.getId(), post.getUserId());
         }
     }
 
