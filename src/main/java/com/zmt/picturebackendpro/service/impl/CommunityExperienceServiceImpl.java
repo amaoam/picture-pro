@@ -5,6 +5,7 @@ import com.zmt.picturebackendpro.exception.BusinessException;
 import com.zmt.picturebackendpro.exception.ErrorCode;
 import com.zmt.picturebackendpro.mapper.UserCommunityProfileMapper;
 import com.zmt.picturebackendpro.mapper.UserExpRecordMapper;
+import com.zmt.picturebackendpro.model.entity.CommunityLikeOutboxEvent;
 import com.zmt.picturebackendpro.model.entity.User;
 import com.zmt.picturebackendpro.model.entity.UserCommunityProfile;
 import com.zmt.picturebackendpro.model.entity.UserExpRecord;
@@ -19,8 +20,7 @@ import javax.annotation.Resource;
 import java.sql.Date;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 
 @Service
 public class CommunityExperienceServiceImpl implements CommunityExperienceService {
@@ -51,6 +51,10 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
     private UserExpRecordMapper expRecordMapper;
     @Resource
     private UserService userService;
+
+    /** 缓存解析后的等级阈值，避免每次点赞/经验变更都拆分配置字符串。 */
+    private volatile List<Long> cachedLevelThresholds;
+    
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -117,6 +121,7 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
         saveProfile(profile);
     }
 
+    /** 兼容旧调用：先检查幂等流水，再改获赞数，防止重复调用重复累计统计。新点赞 API 不再调用此方法。 */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void recordPostLikeAdded(Long postId, Long likerId, Long authorId) {
@@ -133,7 +138,7 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
         if (findRecord(eventKey) != null) {
             saveProfile(profile);
             return;
-        }
+        }   
         UserExpRecord record = buildRecord(authorId, EVENT_RECEIVED_LIKE, eventKey,
                 Math.max(0L, receivedLikeReward), postId, null, likerId, "帖子收到有效点赞奖励");
         expRecordMapper.insert(record);
@@ -141,6 +146,7 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
         saveProfile(profile);
     }
 
+    /** 兼容旧调用；新点赞链路使用带事件 ID 的 processLikeEvents 实现幂等计数。 */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void recordPostLikeRemoved(Long authorId) {
@@ -174,6 +180,77 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
     public void recordPictureLikeRemoved(Long authorId) {
         decreaseReceivedLikeCount(authorId);
     }
+
+    /**
+     * 一批事件中每位作者只锁定、更新一次社区档案。获赞经验按 eventKey 永久去重：
+     * 点赞 -> 取消 -> 再点赞，receivedLikeCount 恢复，但同一个目标/用户不会重复获得获赞经验。
+     * 不处理图片和帖子的点赞数量更新
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void processLikeEvents(List<CommunityLikeOutboxEvent> events) {
+        if (events == null || events.isEmpty()) return;
+            
+        //被点赞对象和点赞数量map
+        Map<Long, Long> receivedLikeDeltas = new TreeMap<>();
+        //被点赞对象set
+        Set<Long> owners = new TreeSet<>();
+        //通过业务键来筛选出需要添加经验的事件
+        Map<String, CommunityLikeOutboxEvent> rewardCandidates = new LinkedHashMap<>();
+
+        for (CommunityLikeOutboxEvent event : events) {
+            Long ownerId = event.getOwnerUserId();
+            if (ownerId != null) {
+                owners.add(ownerId);
+                receivedLikeDeltas.merge(ownerId, event.getDelta().longValue(), Long::sum);
+            }
+            if (event.getDelta() != null && event.getDelta() > 0
+                    && event.getActorUserId() != null && ownerId != null) {
+                String eventKey = likeRewardEventKey(event);
+                // 同一批里相同业务事件也只保留一次，避免重复写入唯一键。
+                rewardCandidates.putIfAbsent(eventKey, event);
+            }
+        }
+
+        // 按用户 ID 从小到大加锁，降低多个消费者批量处理时的死锁概率。
+        Map<Long, UserCommunityProfile> profiles = new TreeMap<>();
+        for (Long ownerId : owners) {
+            profiles.put(ownerId, lockOrCreateProfile(ownerId));
+        }
+
+        List<String> candidateKeys = new ArrayList<>(rewardCandidates.keySet());
+        Set<String> existingKeys = candidateKeys.isEmpty()
+                ? Collections.emptySet()
+                : new TreeSet<>(expRecordMapper.selectExistingEventKeys(candidateKeys));
+        Map<Long, Long> expRewards = new TreeMap<>();
+        long rewardPerLike = Math.max(0L, receivedLikeReward);
+        //用户经验增加流水记录
+        for (Map.Entry<String, CommunityLikeOutboxEvent> candidate : rewardCandidates.entrySet()) {
+            if (existingKeys.contains(candidate.getKey())) continue;
+            CommunityLikeOutboxEvent event = candidate.getValue();
+            boolean isPost = CommunityLikeOutboxEvent.TARGET_POST.equals(event.getTargetType());
+            Long sourcePostId = isPost ? event.getTargetId() : null;
+            String description = isPost ? "帖子收到有效点赞奖励" : "公共图库图片收到有效点赞奖励，pictureId=" + event.getTargetId();
+            // 事件流水、经验值与档案在调用方的 Outbox 消费事务内提交。
+            expRecordMapper.insert(buildRecord(event.getOwnerUserId(), EVENT_RECEIVED_LIKE,
+                    candidate.getKey(), rewardPerLike, sourcePostId, null, event.getActorUserId(), description));
+            expRewards.merge(event.getOwnerUserId(), rewardPerLike, Long::sum);
+        }
+        //添加用户的点赞数量和经验
+        for (Map.Entry<Long, UserCommunityProfile> entry : profiles.entrySet()) {
+            Long ownerId = entry.getKey();
+            UserCommunityProfile profile = entry.getValue();
+            long countDelta = receivedLikeDeltas.getOrDefault(ownerId, 0L);
+            long expDelta = expRewards.getOrDefault(ownerId, 0L);
+            // 同一批点赞/取消相互抵消且没有新经验时，不执行无意义的 profile UPDATE。
+            if (countDelta == 0L && expDelta == 0L) {
+                continue;
+            }
+            profile.setReceivedLikeCount(Math.max(0L, valueOrZero(profile.getReceivedLikeCount()) + countDelta));
+            if (expDelta != 0L) applyExperience(profile, expDelta);
+            saveProfile(profile);
+        }
+    }
     
     //获得个人社区资料
     @Override
@@ -196,6 +273,16 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
             profile.setReceivedLikeCount(0L);
         }
         return toVO(profile);
+    }
+
+    private String likeRewardEventKey(CommunityLikeOutboxEvent event) {
+        if (CommunityLikeOutboxEvent.TARGET_POST.equals(event.getTargetType())) {
+            return "POST_RECEIVED_LIKE:" + event.getTargetId() + ":" + event.getActorUserId();
+        }
+        if (CommunityLikeOutboxEvent.TARGET_PICTURE.equals(event.getTargetType())) {
+            return "PICTURE_RECEIVED_LIKE:" + event.getTargetId() + ":" + event.getActorUserId();
+        }
+        throw new IllegalArgumentException("未知点赞目标类型：" + event.getTargetType());
     }
 
     private void decreaseReceivedLikeCount(Long authorId) {
@@ -298,27 +385,30 @@ public class CommunityExperienceServiceImpl implements CommunityExperienceServic
     
     //通过配置获取等级梯度
     private List<Long> getLevelThresholds() {
-        List<Long> thresholds = new ArrayList<>();
-        if (levelThresholdsText != null) {
-            String[] parts = levelThresholdsText.split(",");
-            for (String part : parts) {
-                try {
-                    long value = Long.parseLong(part.trim());
-                    if (value >= 0 && (thresholds.isEmpty() || value > thresholds.get(thresholds.size() - 1))) {
-                        thresholds.add(value);
+        List<Long> result = cachedLevelThresholds;
+        if (result != null) return result;
+        synchronized (this) {
+            result = cachedLevelThresholds;
+            if (result != null) return result;
+            List<Long> thresholds = new ArrayList<>();
+            if (levelThresholdsText != null) {
+                for (String part : levelThresholdsText.split(",")) {
+                    try {
+                        long value = Long.parseLong(part.trim());
+                        if (value >= 0 && (thresholds.isEmpty() || value > thresholds.get(thresholds.size() - 1))) {
+                            thresholds.add(value);
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // 非法配置项忽略，最终回退到默认配置。
                     }
-                } catch (NumberFormatException ignored) {
-                    // 忽略非法项，后面回退到默认阈值。
                 }
             }
+            if (thresholds.isEmpty() || thresholds.get(0) != 0L) {
+                Collections.addAll(thresholds, 0L, 100L, 300L, 600L, 1000L, 1500L, 2200L, 3000L, 4000L, 5500L);
+            }
+            cachedLevelThresholds = List.copyOf(thresholds);
+            return cachedLevelThresholds;
         }
-        if (thresholds.isEmpty() || thresholds.get(0) != 0L) {
-            return new ArrayList<Long>() {{
-                add(0L); add(100L); add(300L); add(600L); add(1000L);
-                add(1500L); add(2200L); add(3000L); add(4000L); add(5500L);
-            }};
-        }
-        return thresholds;
     }
 
     private long valueOrZero(Long value) {

@@ -129,7 +129,10 @@ public class Picture implements Serializable {
      */
     @TableLogic
     private Integer isDelete;
-
+    
+    /** 公共图库图片点赞总数；异步计数消费者维护。 */
+    private Long likeCount;
+    
     @TableField(exist = false)
     private static final long serialVersionUID = 1L;
 }

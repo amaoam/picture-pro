@@ -74,3 +74,9 @@ community:
     daily-comment-cap: 20
     level-thresholds: 0,100,300,600,1000,1500,2200,3000,4000,5500
     zone-id: Asia/Shanghai
+  like:
+    outbox:
+      # 初始压测参数：每个消费者每隔约 100ms 领取一批；共有 4 个调度 worker。
+      poll-delay-ms: 100
+      batch-size: 200
+      max-retries: 10

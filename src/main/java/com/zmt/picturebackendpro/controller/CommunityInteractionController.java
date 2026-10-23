@@ -11,6 +11,7 @@ import com.zmt.picturebackendpro.model.entity.User;
 import com.zmt.picturebackendpro.model.vo.community.CommunityCommentVO;
 import com.zmt.picturebackendpro.model.vo.community.CommunityLikeStatusVO;
 import com.zmt.picturebackendpro.service.CommunityInteractionService;
+import com.zmt.picturebackendpro.service.CommunityLikeService;
 import com.zmt.picturebackendpro.service.UserService;
 import org.springframework.web.bind.annotation.*;
 
@@ -20,6 +21,10 @@ import javax.servlet.http.HttpServletRequest;
 @RestController
 @RequestMapping("/community")
 public class CommunityInteractionController {
+
+    /** 新点赞链路：MySQL 关系 + Outbox 事件，统计计数由后台批量处理。 */
+    @Resource private CommunityLikeService likeService;
+    /** 评论流程仍使用已有互动服务，避免把点赞异步逻辑混进评论事务。 */
     @Resource private CommunityInteractionService interactionService;
     @Resource private UserService userService;
     
@@ -28,14 +33,15 @@ public class CommunityInteractionController {
     public BaseResponse<CommunityLikeStatusVO> likePost(@PathVariable("postId") Long postId,
                                                         HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(interactionService.likePost(postId, user));
+        return ResultUtils.success(likeService.likePost(postId, user));
     }
+    
     //给帖子取消点赞
     @DeleteMapping("/post/{postId}/like")
     public BaseResponse<CommunityLikeStatusVO> unlikePost(@PathVariable("postId") Long postId,
                                                           HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(interactionService.unlikePost(postId, user));
+        return ResultUtils.success(likeService.unlikePost(postId, user));
     }
     
     //获取帖子点赞状态
@@ -43,7 +49,7 @@ public class CommunityInteractionController {
     public BaseResponse<CommunityLikeStatusVO> postLikeStatus(@PathVariable("postId") Long postId,
                                                               HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(interactionService.getPostLikeStatus(postId, user));
+        return ResultUtils.success(likeService.getPostLikeStatus(postId, user));
     }
     
     //图片点赞
@@ -51,7 +57,7 @@ public class CommunityInteractionController {
     public BaseResponse<CommunityLikeStatusVO> likePublicPicture(@PathVariable("pictureId") Long pictureId,
                                                                  HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(interactionService.likePublicPicture(pictureId, user));
+        return ResultUtils.success(likeService.likePublicPicture(pictureId, user));
     }
     
     //图片取消点赞
@@ -59,7 +65,7 @@ public class CommunityInteractionController {
     public BaseResponse<CommunityLikeStatusVO> unlikePublicPicture(@PathVariable("pictureId") Long pictureId,
                                                                    HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(interactionService.unlikePublicPicture(pictureId, user));
+        return ResultUtils.success(likeService.unlikePublicPicture(pictureId, user));
     }
     
     //查看图片点赞状态
@@ -67,7 +73,7 @@ public class CommunityInteractionController {
     public BaseResponse<CommunityLikeStatusVO> publicPictureLikeStatus(@PathVariable("pictureId") Long pictureId,
                                                                        HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(interactionService.getPublicPictureLikeStatus(pictureId, user));
+        return ResultUtils.success(likeService.getPublicPictureLikeStatus(pictureId, user));
     }
     
     //给帖子评论

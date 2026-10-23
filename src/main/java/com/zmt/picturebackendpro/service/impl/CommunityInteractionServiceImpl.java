@@ -273,7 +273,8 @@ public class CommunityInteractionServiceImpl implements CommunityInteractionServ
         if (communityCommentMapper.insert(comment) != 1) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "发表评论失败");
         }
-        updatePostCounter(postId, "commentCount", 1, true, true);        experienceService.recordCommentCreated(comment.getId(), postId, loginUser.getId());
+        updatePostCounter(postId, "commentCount", 1, true, true);        
+        experienceService.recordCommentCreated(comment.getId(), postId, loginUser.getId());
         return comment.getId();
     }
 
