@@ -105,3 +105,7 @@ application-local.properties
 k6/users.local.json
 results/*.json
 results/*.log
+config/.env
+k6/targets.local.json
+results/*
+!results/.gitkeep

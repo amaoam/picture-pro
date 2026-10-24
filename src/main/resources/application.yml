@@ -77,12 +77,15 @@ community:
     zone-id: Asia/Shanghai
   like:
     outbox:
-      poll-delay-ms: 100
-      # 一轮先领取最多多少个不同目标；同目标只有一个 worker 能处理。
-      target-batch-size: 20
-      # 每个目标每轮最多读取多少条未完成事件。压测后再调整。
-      max-events-per-target: 100
-      max-retries: 10
+      # 删除/替换旧 poll-delay-ms；V2.2 改为以下自适应参数。
+      workers: 4
+      idle-min-poll-delay-ms: 25
+      idle-max-poll-delay-ms: 500
+      busy-poll-delay-ms: 1
+      error-poll-delay-ms: 1000
+      poll-jitter-percent: 10
+      initial-worker-stagger-ms: 25
+      # target-batch-size、max-events-per-target、max-retries 保留 V2.1 的原值
 # Spring Boot Actuator / Prometheus。生产环境应通过网络策略限制这些端点的访问。
 management:
   endpoints:
@@ -92,3 +95,9 @@ management:
   endpoint:
     health:
       show-details: never
+  metrics:
+    distribution:
+      percentiles-histogram:
+        "http.server.requests": true
+        "community.like.outbox.batch.duration": true
+        "community.like.outbox.poll.duration": true

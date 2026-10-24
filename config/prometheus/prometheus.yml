@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["prometheus:9090"]
+
+  # Spring Boot runs on Windows host in this tutorial. If the app is itself in Docker,
+  # replace host.docker.internal:8123 with the app's Compose service name and port.
+  - job_name: picture-backend
+    metrics_path: /api/actuator/prometheus
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["host.docker.internal:8123"]
+        labels:
+          application: picture-backend

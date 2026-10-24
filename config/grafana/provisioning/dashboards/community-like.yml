@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Community Like Dashboards
+    orgId: 1
+    folder: Community Like
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -10,9 +10,9 @@ const RATE = Number(__ENV.RATE || 10);
 const DURATION = __ENV.DURATION || '30s';
 const PRE_VUS = Number(__ENV.PRE_VUS || 10);
 const MAX_VUS = Number(__ENV.MAX_VUS || 20);
-const SESSION_COOKIE_NAME = __ENV.SESSION_COOKIE_NAME || 'NjI5MmIwYmMtOTRmZi00YmYxLTg3OTgtYjBmOTNkNGIzZTQ1';
+const SESSION_COOKIE_NAME = __ENV.SESSION_COOKIE_NAME || 'satoken';
 const businessFailures = new Rate('business_failures');
-
+s
 // 由 scripts/New-LoadTestUsers.ps1 生成。文件只保存在本地，不要提交到 Git。
 const credentials = new SharedArray('load-test-credentials', function () {
   return JSON.parse(open(__ENV.USERS_FILE || './users.local.json')); 
