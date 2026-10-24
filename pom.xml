@@ -134,6 +134,16 @@
             <version>26.0.2-1</version>
             <scope>compile</scope>
         </dependency>
+        <!-- 新增：暴露应用健康、计时器、Outbox 及 Prometheus 指标。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
     </dependencies>
 
     <dependencyManagement>

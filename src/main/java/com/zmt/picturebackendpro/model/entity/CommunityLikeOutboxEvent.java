@@ -1,6 +1,7 @@
 package com.zmt.picturebackendpro.model.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
@@ -70,6 +71,10 @@ public class CommunityLikeOutboxEvent implements Serializable {
      * 执行时间
      */
     private Date processedTime;
+
+    /** SQL 根据数据库 NOW() 计算此值，防止应用服务器与数据库时钟偏差破坏事件顺序。 */
+    @TableField(exist = false)
+    private Boolean retryDue;
 
     private static final long serialVersionUID = 1L;
 }

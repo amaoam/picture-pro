@@ -31,7 +31,8 @@ spring:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true # 
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl # 打印SQL日志
+#    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl # 打印SQL日志
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
   global-config:
     db-config:
       logic-delete-field: isDelete
@@ -76,7 +77,18 @@ community:
     zone-id: Asia/Shanghai
   like:
     outbox:
-      # 初始压测参数：每个消费者每隔约 100ms 领取一批；共有 4 个调度 worker。
       poll-delay-ms: 100
-      batch-size: 200
+      # 一轮先领取最多多少个不同目标；同目标只有一个 worker 能处理。
+      target-batch-size: 20
+      # 每个目标每轮最多读取多少条未完成事件。压测后再调整。
+      max-events-per-target: 100
       max-retries: 10
+# Spring Boot Actuator / Prometheus。生产环境应通过网络策略限制这些端点的访问。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: never

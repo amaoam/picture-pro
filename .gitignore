@@ -102,3 +102,6 @@ application-local.yml
 application-local.properties
 # 如确实需要强制忽略主配置，再解开下面这行（非常不推荐）
 # src/main/resources/application.yml
+k6/users.local.json
+results/*.json
+results/*.log

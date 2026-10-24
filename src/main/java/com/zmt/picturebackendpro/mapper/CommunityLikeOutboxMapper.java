@@ -9,120 +9,104 @@ import org.apache.ibatis.annotations.Update;
 
 import java.util.List;
 import java.util.Map;
-
+/** Outbox 查询与批量计数 SQL。面向 MySQL 8.0+。 */
 @Mapper
 public interface CommunityLikeOutboxMapper extends BaseMapper<CommunityLikeOutboxEvent> {
 
     /**
-     * 分批拉取待处理的点赞事件（支持高并发分布式锁/多实例抢占）
+     * 每个目标只领取最早的一条未完成事件。
      *
-     * <p><strong>核心机制：</strong>
-     * <ul>
-     *   <li>利用 MySQL 8.0 的 {@code FOR UPDATE SKIP LOCKED} 语法，使多个工作线程或应用实例能够同时并发拉取不同的事件行，而不会发生行锁等待（Block）。</li>
-     *   <li>配合 {@code status = 0}（待处理）以及重试时间过滤条件，确保只有到期或从未执行的事件会被选中。</li>
-     * </ul>
-     *
-     * @param limit 本次拉取的最大批次数量
-     * @return 待处理的社区点赞事件列表
+     * 关键点：状态 2 的死信也属于“未完成”。如果同一目标存在更早的待处理/死信，
+     * 后续事件不能越过它；否则 +1、-1 的应用顺序可能与点赞关系变更顺序相反。
+     * SKIP LOCKED 允许不同消费者并行领取不同目标，已被锁住的 head 会继续阻止同目标后续事件被领取。
      */
-    @Select("SELECT id, targetType, targetId, actorUserId, ownerUserId, delta, status, retryCount, " +
-            "nextRetryTime, lastError, createTime, processedTime " +
-            "FROM like_event_outbox " +
-            "WHERE status = 0 AND (nextRetryTime IS NULL OR nextRetryTime <= NOW()) " +
-            "ORDER BY id ASC LIMIT #{limit} FOR UPDATE SKIP LOCKED")
-    List<CommunityLikeOutboxEvent> selectPendingBatchForUpdate(@Param("limit") int limit);
+    @Select("SELECT e.id, e.targetType, e.targetId, e.actorUserId, e.ownerUserId, e.delta, e.status, " +
+            "e.retryCount, e.nextRetryTime, e.lastError, e.createTime, e.processedTime " +
+            "FROM like_event_outbox e " +
+            "WHERE e.status = 0 " +
+            "AND (e.nextRetryTime IS NULL OR e.nextRetryTime <= NOW()) " +
+            "AND NOT EXISTS (" +
+            "  SELECT 1 FROM like_event_outbox earlier " +
+            "  WHERE earlier.targetType = e.targetType AND earlier.targetId = e.targetId " +
+            "    AND earlier.id < e.id AND earlier.status <> 1" +
+            ") " +
+            "ORDER BY e.id ASC LIMIT #{limit} FOR UPDATE SKIP LOCKED")
+    List<CommunityLikeOutboxEvent> selectPendingTargetHeads(@Param("limit") int limit);
 
     /**
-     * 一条 SQL 合并更新本批次内多个帖子的点赞计数（批量更新优化）
+     * 对刚领取到 head 的目标，取每个目标前 N 条未完成事件（包括死信和尚未到重试时间的事件）。
      *
-     * <p><strong>技术亮点：</strong>
-     * <ul>
-     *   <li>使用 MyBatis 的 {@code <foreach>} 动态拼接 SQL，在一条 SQL 中通过 {@code CASE WHEN} 为不同的帖子分发不同的增减量，避免循环单条执行造成的数据库性能开销。</li>
-     *   <li>使用 {@code GREATEST(0, ...)} 防止点赞数在并发极端情况下出现负数。</li>
-     * </ul>
-     *
-     * @param deltas Map 结构，Key 为帖子 ID（targetId），Value 为点赞增减量（如 +1 或 -1）
-     * @受影响的行数
-     */
-    @Update({"<script>",
-            "UPDATE community_post SET likeCount = GREATEST(0, COALESCE(likeCount, 0) + CASE id",
-            "<foreach collection='deltas' index='targetId' item='delta'> WHEN #{targetId} THEN #{delta} </foreach>",
-            "ELSE 0 END WHERE id IN",
-            "<foreach collection='deltas' index='targetId' item='delta' open='(' separator=',' close=')'>#{targetId}</foreach>",
-            "</script>"})
-    int batchAdjustPostLikeCounts(@Param("deltas") Map<Long, Long> deltas);
-
-    /**
-     * 校验给定的帖子 ID 集合中哪些在数据库真实存在
-     *
-     * <p>用于在执行批量更新前过滤掉无效或已被物理删除的实体 ID，防止由于外键或业务异常导致整批事务回滚。
-     *
-     * @param ids 待校验的帖子 ID 列表
-     * @return 数据库中真实存在的帖子 ID 列表
+     * ROW_NUMBER 保证每个 target 的事件按 ID 排序并限制单目标批量大小。retryDue 使用数据库 NOW() 计算。
+     * Java 层只处理每个 target 从头开始的连续到期前缀；遇到未来重试事件或死信后，
+     * 本次不处理该目标更晚的任何事件。head 锁使其他 worker 无法并行消费同一目标。
      */
     @Select({"<script>",
-            "SELECT id FROM community_post WHERE id IN",
+            "SELECT e.id, e.targetType, e.targetId, e.actorUserId, e.ownerUserId, e.delta, e.status, ",
+            "e.retryCount, e.nextRetryTime, e.lastError, e.createTime, e.processedTime, ",
+            "CASE WHEN e.nextRetryTime IS NULL OR e.nextRetryTime &lt;= NOW() THEN 1 ELSE 0 END AS retryDue ",
+            "FROM like_event_outbox e ",
+            "JOIN (",
+            "  SELECT id, ROW_NUMBER() OVER (PARTITION BY targetType, targetId ORDER BY id ASC) AS targetRowNumber ",
+            "  FROM like_event_outbox ",
+            "  WHERE status &lt;&gt; 1 AND (",
+            "    <if test='postIds != null and postIds.size() > 0'>",
+            "      (targetType = 'POST' AND targetId IN ",
+            "        <foreach collection='postIds' item='id' open='(' separator=',' close=')'>#{id}</foreach>)",
+            "    </if>",
+            "    <if test='postIds != null and postIds.size() > 0 and pictureIds != null and pictureIds.size() > 0'> OR </if>",
+            "    <if test='pictureIds != null and pictureIds.size() > 0'>",
+            "      (targetType = 'PICTURE' AND targetId IN ",
+            "        <foreach collection='pictureIds' item='id' open='(' separator=',' close=')'>#{id}</foreach>)",
+            "    </if>",
+            "  )",
+            ") ranked ON ranked.id = e.id ",
+            "WHERE ranked.targetRowNumber &lt;= #{maxEventsPerTarget} ",
+            "ORDER BY e.id ASC FOR UPDATE",
+            "</script>"})
+    List<CommunityLikeOutboxEvent> selectEventsForTargets(
+            @Param("postIds") List<Long> postIds,
+            @Param("pictureIds") List<Long> pictureIds,
+            @Param("maxEventsPerTarget") int maxEventsPerTarget);
+
+    @Select({"<script>",
+            "SELECT id FROM community_post WHERE id IN ",
             "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach>",
             "</script>"})
     List<Long> selectExistingPostIds(@Param("ids") List<Long> ids);
 
-    /**
-     * 校验给定的公共图片 ID 集合中哪些在数据库真实存在
-     *
-     * @param ids 待校验的图片 ID 列表
-     * @return 数据库中真实存在的图片 ID 列表
-     */
     @Select({"<script>",
-            "SELECT id FROM picture WHERE id IN",
+            "SELECT id FROM picture WHERE id IN ",
             "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach>",
             "</script>"})
     List<Long> selectExistingPictureIds(@Param("ids") List<Long> ids);
 
-    /**
-     * 一条 SQL 合并更新本批次内多张公共图片的点赞计数
-     *
-     * @param deltas Map 结构，Key 为图片 ID（targetId），Value 为点赞增减量
-     * @return 受影响的行数
-     */
+    /** 一条 UPDATE 按 CASE 将不同的 delta 应用到对应帖子，避免逐条更新。 */
     @Update({"<script>",
-            "UPDATE picture SET likeCount = GREATEST(0, COALESCE(likeCount, 0) + CASE id",
+            "UPDATE community_post SET likeCount = GREATEST(0, COALESCE(likeCount, 0) + CASE id ",
             "<foreach collection='deltas' index='targetId' item='delta'> WHEN #{targetId} THEN #{delta} </foreach>",
-            "ELSE 0 END WHERE id IN",
+            "ELSE 0 END WHERE id IN ",
+            "<foreach collection='deltas' index='targetId' item='delta' open='(' separator=',' close=')'>#{targetId}</foreach>",
+            "</script>"})
+    int batchAdjustPostLikeCounts(@Param("deltas") Map<Long, Long> deltas);
+
+    /** 一条 UPDATE 按 CASE 将不同的 delta 应用到对应公共图片。 */
+    @Update({"<script>",
+            "UPDATE picture SET likeCount = GREATEST(0, COALESCE(likeCount, 0) + CASE id ",
+            "<foreach collection='deltas' index='targetId' item='delta'> WHEN #{targetId} THEN #{delta} </foreach>",
+            "ELSE 0 END WHERE id IN ",
             "<foreach collection='deltas' index='targetId' item='delta' open='(' separator=',' close=')'>#{targetId}</foreach>",
             "</script>"})
     int batchAdjustPictureLikeCounts(@Param("deltas") Map<Long, Long> deltas);
 
-    /**
-     * 标记事件批次为“已处理”状态
-     *
-     * <p><strong>事务边界：</strong>计数更新与经验值变更等业务事务全部成功提交后，才调用此方法。
-     * 同时清空重试时间和错误信息，将 {@code status} 设为 {@code 1}（已完成）。
-     *
-     * @param ids 成功处理的事件 ID 列表
-     * @return 更新成功的记录行数
-     */
+    /** 计数、经验和状态标记同事务提交；只允许把当前待处理事件标记为完成。 */
     @Update({"<script>",
-            "UPDATE like_event_outbox SET status = 1, processedTime = NOW(), nextRetryTime = NULL, lastError = NULL",
-            "WHERE status = 0 AND id IN",
+            "UPDATE like_event_outbox SET status = 1, processedTime = NOW(), nextRetryTime = NULL, lastError = NULL ",
+            "WHERE status = 0 AND id IN ",
             "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach>",
             "</script>"})
     int markProcessed(@Param("ids") List<Long> ids);
 
-    /**
-     * 记录批次处理失败并制定退避重试策略（支持死信队列机制）
-     *
-     * <p><strong>核心业务逻辑：</strong>
-     * <ul>
-     *   <li><strong>阶梯退避：</strong>根据当前的 {@code retryCount} 动态计算下一次重试时间（如第0次重试1秒后，第1次5秒后，小于5次15秒后，之后每60秒重试一次）。</li>
-     *   <li><strong>死信处理：</strong>当累计重试次数达到 {@code maxRetries} 阈值时，自动将状态变更为 {@code status = 2}（死信状态），防止无限重试耗尽资源，需要人工或对账系统介入。</li>
-     *   <li><strong>赋值顺序陷阱：</strong>为避免 MySQL 单表 {@code UPDATE} 从左向右赋值的副作用影响，{@code retryCount = retryCount + 1} 必须放置在 {@code SET} 子句的最后。</li>
-     * </ul>
-     *
-     * @param ids          失败的事件 ID 列表
-     * @param errorMessage 异常错误信息（会被截断至 500 字符内防止超出字段长度）
-     * @param maxRetries   允许的最大重试次数阈值
-     * @return 更新成功的记录行数
-     */
+    /** 外层批处理事务回滚之后，在 REQUIRES_NEW 事务里记录指数退避时间和死信状态。 */
     @Update({"<script>",
             "UPDATE like_event_outbox SET ",
             "status = CASE WHEN retryCount + 1 &gt;= #{maxRetries} THEN 2 ELSE 0 END, ",
@@ -138,4 +122,14 @@ public interface CommunityLikeOutboxMapper extends BaseMapper<CommunityLikeOutbo
     int recordBatchFailure(@Param("ids") List<Long> ids,
                            @Param("errorMessage") String errorMessage,
                            @Param("maxRetries") int maxRetries);
+
+    @Select("SELECT COUNT(*) FROM like_event_outbox WHERE status = 0")
+    long countPendingEvents();
+
+    @Select("SELECT COUNT(*) FROM like_event_outbox WHERE status = 2")
+    long countDeadEvents();
+
+    @Select("SELECT COALESCE(TIMESTAMPDIFF(SECOND, MIN(createTime), NOW()), 0) " +
+            "FROM like_event_outbox WHERE status = 0")
+    long oldestPendingAgeSeconds();
 }
