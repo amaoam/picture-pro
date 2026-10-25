@@ -84,7 +84,7 @@ public interface CommunityLikeOutboxMapper extends BaseMapper<CommunityLikeOutbo
     @Update({"<script>",
             "UPDATE community_post SET likeCount = GREATEST(0, COALESCE(likeCount, 0) + CASE id ",
             "<foreach collection='deltas' index='targetId' item='delta'> WHEN #{targetId} THEN #{delta} </foreach>",
-            "ELSE 0 END WHERE id IN ",
+            "ELSE 0 END) WHERE id IN ",
             "<foreach collection='deltas' index='targetId' item='delta' open='(' separator=',' close=')'>#{targetId}</foreach>",
             "</script>"})
     int batchAdjustPostLikeCounts(@Param("deltas") Map<Long, Long> deltas);
@@ -93,7 +93,7 @@ public interface CommunityLikeOutboxMapper extends BaseMapper<CommunityLikeOutbo
     @Update({"<script>",
             "UPDATE picture SET likeCount = GREATEST(0, COALESCE(likeCount, 0) + CASE id ",
             "<foreach collection='deltas' index='targetId' item='delta'> WHEN #{targetId} THEN #{delta} </foreach>",
-            "ELSE 0 END WHERE id IN ",
+            "ELSE 0 END) WHERE id IN ",
             "<foreach collection='deltas' index='targetId' item='delta' open='(' separator=',' close=')'>#{targetId}</foreach>",
             "</script>"})
     int batchAdjustPictureLikeCounts(@Param("deltas") Map<Long, Long> deltas);
