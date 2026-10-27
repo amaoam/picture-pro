@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 
 /**
  * Redis 点赞事件 MySQL 持久化服务
@@ -168,21 +169,29 @@ public class RedisLikePersistenceService {
         if ("POST".equals(event.getTargetType())) {
             if ("LIKE".equals(event.getDesiredState())) {
                 return jdbcTemplate.update(
-                        "INSERT IGNORE INTO community_post_like (postId,userId,createTime) VALUES (?,?,CURRENT_TIMESTAMP(3))",
-                        targetId, userId);
+                        "INSERT IGNORE INTO community_post_like " +
+                                "(id, postId, userId, createTime) " +
+                                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                        IdWorker.getId(), targetId, userId);
             }
+
             return jdbcTemplate.update(
-                    "DELETE FROM community_post_like WHERE postId=? AND userId=?", targetId, userId);
+                    "DELETE FROM community_post_like WHERE postId=? AND userId=?",
+                    targetId, userId);
         }
 
         if ("PICTURE".equals(event.getTargetType())) {
             if ("LIKE".equals(event.getDesiredState())) {
                 return jdbcTemplate.update(
-                        "INSERT IGNORE INTO picture_like (pictureId,userId,createTime) VALUES (?,?,CURRENT_TIMESTAMP(3))",
-                        targetId, userId);
+                        "INSERT IGNORE INTO picture_like " +
+                                "(id, pictureId, userId, createTime) " +
+                                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                        IdWorker.getId(), targetId, userId);
             }
+
             return jdbcTemplate.update(
-                    "DELETE FROM picture_like WHERE pictureId=? AND userId=?", targetId, userId);
+                    "DELETE FROM picture_like WHERE pictureId=? AND userId=?",
+                    targetId, userId);
         }
 
         throw new IllegalArgumentException("Unsupported like target type: " + event.getTargetType());
