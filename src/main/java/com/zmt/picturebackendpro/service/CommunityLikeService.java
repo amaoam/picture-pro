@@ -12,4 +12,21 @@ public interface CommunityLikeService {
     CommunityLikeStatusVO likePublicPicture(Long pictureId, User loginUser);
     CommunityLikeStatusVO unlikePublicPicture(Long pictureId, User loginUser);
     CommunityLikeStatusVO getPublicPictureLikeStatus(Long pictureId, User loginUser);
+
+    /** 默认实现保持旧数据库服务兼容；Redis 版会覆盖该重载并使用调用方提供的 requestId。 */
+    default CommunityLikeStatusVO likePost(Long postId, User loginUser, String requestId) {
+        return likePost(postId, loginUser);
+    }
+
+    default CommunityLikeStatusVO unlikePost(Long postId, User loginUser, String requestId) {
+        return unlikePost(postId, loginUser);
+    }
+
+    default CommunityLikeStatusVO likePublicPicture(Long pictureId, User loginUser, String requestId) {
+        return likePublicPicture(pictureId, loginUser);
+    }
+
+    default CommunityLikeStatusVO unlikePublicPicture(Long pictureId, User loginUser, String requestId) {
+        return unlikePublicPicture(pictureId, loginUser);
+    }
 }

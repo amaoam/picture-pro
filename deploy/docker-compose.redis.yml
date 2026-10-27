@@ -1,0 +1,21 @@
+services:
+  community-like-redis-v3:
+    image: redis:7.4-alpine
+    container_name: picture-like-v3-redis
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      # 独立测试端口，避免碰到已有 Redis 6379。
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - community-like-v3-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # 没配置密码仅适用于本机开发，生产请设置 ACL/密码并限制 bind/ports。
+
+volumes:
+  community-like-v3-redis-data:

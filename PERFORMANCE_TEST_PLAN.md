@@ -94,7 +94,7 @@ https://grafana.com/docs/k6/latest/set-up/install-k6/
 2. 在压缩包根目录打开 PowerShell。先做小规模测试，例如创建 20 个测试账号：
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\scripts\New-LoadTestUsers.ps1 -Count 20
+   powershell -ExecutionPolicy Bypass -File .\scripts\New-LoadTestUsers.ps1 -Count 300
    ```
 
 3. 脚本会调用 `POST /api/user/register` 创建专用账号，并生成 `k6\users.local.json`。这个文件包含测试密码，已被 `.gitignore` 排除，不要提交或分享。
@@ -135,8 +135,8 @@ $env:TARGET_TYPE = "POST"
 $env:TARGET_ID = "2112391798298521601"
 $env:RATE = "1000"
 $env:DURATION = "3m"
-$env:PRE_VUS = "100"
-$env:MAX_VUS = "200"
+$env:PRE_VUS = "200"
+$env:MAX_VUS = "300"
 k6 run .\k6\community_like.js --summary-export .\results\summary-1rps.json
 ```
 

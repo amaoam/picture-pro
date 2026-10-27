@@ -1,5 +1,6 @@
 package com.zmt.picturebackendpro.controller;
 
+import cn.hutool.core.lang.UUID;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.zmt.picturebackendpro.common.BaseResponse;
 import com.zmt.picturebackendpro.common.ResultUtils;
@@ -13,6 +14,7 @@ import com.zmt.picturebackendpro.model.vo.community.CommunityLikeStatusVO;
 import com.zmt.picturebackendpro.service.CommunityInteractionService;
 import com.zmt.picturebackendpro.service.CommunityLikeService;
 import com.zmt.picturebackendpro.service.UserService;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
@@ -22,7 +24,7 @@ import javax.servlet.http.HttpServletRequest;
 @RequestMapping("/community")
 public class CommunityInteractionController {
 
-    /** 新点赞链路：MySQL 关系 + Outbox 事件，统计计数由后台批量处理。 */
+    /** 根据 community.like.mode 注入数据库基线或 Redis V3 实现；Controller 不绑定具体存储。 */
     @Resource private CommunityLikeService likeService;
     /** 评论流程仍使用已有互动服务，避免把点赞异步逻辑混进评论事务。 */
     @Resource private CommunityInteractionService interactionService;
@@ -31,17 +33,19 @@ public class CommunityInteractionController {
     //给帖子点赞
     @PostMapping("/post/{postId}/like")
     public BaseResponse<CommunityLikeStatusVO> likePost(@PathVariable("postId") Long postId,
+                                                        @RequestHeader(value = "X-Request-Id", required = false) String requestId,
                                                         HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(likeService.likePost(postId, user));
+        return ResultUtils.success(likeService.likePost(postId, user, ensureRequestId(requestId)));
     }
     
     //给帖子取消点赞
     @DeleteMapping("/post/{postId}/like")
     public BaseResponse<CommunityLikeStatusVO> unlikePost(@PathVariable("postId") Long postId,
+                                                          @RequestHeader(value = "X-Request-Id", required = false) String requestId,
                                                           HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(likeService.unlikePost(postId, user));
+        return ResultUtils.success(likeService.unlikePost(postId, user, ensureRequestId(requestId)));
     }
     
     //获取帖子点赞状态
@@ -55,17 +59,19 @@ public class CommunityInteractionController {
     //图片点赞
     @PostMapping("/picture/{pictureId}/like")
     public BaseResponse<CommunityLikeStatusVO> likePublicPicture(@PathVariable("pictureId") Long pictureId,
+                                                                 @RequestHeader(value = "X-Request-Id", required = false) String requestId,
                                                                  HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(likeService.likePublicPicture(pictureId, user));
+        return ResultUtils.success(likeService.likePublicPicture(pictureId, user, ensureRequestId(requestId)));
     }
     
     //图片取消点赞
     @DeleteMapping("/picture/{pictureId}/like")
     public BaseResponse<CommunityLikeStatusVO> unlikePublicPicture(@PathVariable("pictureId") Long pictureId,
+                                                                   @RequestHeader(value = "X-Request-Id", required = false) String requestId,
                                                                    HttpServletRequest request) {
         User user = userService.getLoginUser(request);
-        return ResultUtils.success(likeService.unlikePublicPicture(pictureId, user));
+        return ResultUtils.success(likeService.unlikePublicPicture(pictureId, user, ensureRequestId(requestId)));
     }
     
     //查看图片点赞状态
@@ -105,5 +111,10 @@ public class CommunityInteractionController {
         User user = userService.getLoginUser(request);
         interactionService.deleteComment(commentId, user);
         return ResultUtils.success(true);
+    }
+
+    private String ensureRequestId(String requestId) {
+        // 没传 header 时仍兼容旧客户端；要获得可靠重试幂等，客户端应在一条请求的所有重试中复用该 ID。
+        return StringUtils.hasText(requestId) ? requestId.trim() : UUID.randomUUID().toString();
     }
 }
