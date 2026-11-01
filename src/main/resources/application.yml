@@ -123,36 +123,37 @@ community:
 #      # 失败达到阈值仅用于加重日志告警；不会跳过消息，保护同目标事件顺序。
 #      repeated-error-warning-threshold: 5
     mode: rabbitmq
-  redis:
-    host: 127.0.0.1
-    port: 6380
-    database: 0
-    password: ""
-    key-prefix: picture:like:rabbitmq:v1
-    shard-count: 16
-    idempotency-ttl-seconds: 86400
-  rabbitmq:
-    exchange: community.like.exchange.v1
-    queue: community.like.commands.v1
-    routing-key: community.like.command.v1
-    dead-exchange: community.like.dead.exchange.v1
-    dead-queue: community.like.commands.dead.v1
-    dead-routing-key: community.like.dead.v1
-    relay-group: community-like-rabbitmq-relay-v1
-    relay-consumer: community-like-rabbitmq-relay-0
-    relay-batch-size: 100
-    relay-poll-delay-ms: 10
-    publisher-confirm-timeout-ms: 5000
-    consumer-batch-size: 100
-    consumer-receive-timeout-ms: 50
-    consumer-prefetch: 100
-    metadata-cache-ttl-ms: 3000
-    metadata-cache-max-size: 100000
-    max-retries: 8
-    retry-base-delay-ms: 1000
-    reconcile-initial-delay-ms: 120000
-    reconcile-interval-ms: 300000
-    quiet-period-ms: 30000
+    redis:
+      host: 127.0.0.1
+      port: 6380
+      database: 0
+      password: ""
+      key-prefix: picture:like:rabbitmq:v1
+      shard-count: 16
+      idempotency-ttl-seconds: 86400
+    rabbitmq:
+      exchange: community.like.exchange.v1
+      queue: community.like.commands.v1
+      routing-key: community.like.command.v1
+      dead-exchange: community.like.dead.exchange.v1
+      dead-queue: community.like.commands.dead.v1
+      dead-routing-key: community.like.dead.v1
+      relay-group: community-like-rabbitmq-relay-v1
+      relay-consumer: community-like-rabbitmq-relay-0
+      relay-batch-size: 100
+      relay-poll-delay-ms: 10
+      publisher-confirm-timeout-ms: 5000
+      consumer-receive-timeout-ms: 50
+      metadata-cache-ttl-ms: 3000
+      metadata-cache-max-size: 100000
+      consumer-concurrency: 3
+      consumer-batch-size: 100
+      consumer-prefetch: 100
+      max-retries: 8
+      retry-base-delay-ms: 1000
+      reconcile-initial-delay-ms: 120000
+      reconcile-interval-ms: 300000
+      quiet-period-ms: 30000
 # Spring Boot Actuator / Prometheus。生产环境应通过网络策略限制这些端点的访问。
 management:
   endpoints:

@@ -39,10 +39,14 @@ import java.util.UUID;
  * 重试与死信：
  * <ul>
  *   <li>每次失败在 Redis Hash 中累加重试次数（按稳定 messageId）；</li>
- *   <li>未达上限：指数退避后 NACK 重回队列；</li>
+ *   <li>未达上限：<b>投递到延迟重试队列</b>并等待 Publisher Confirm，成功后 ACK 原消息，
+ *       由 Retry Queue 的 TTL + DLX 在到期后自动回到主队列。这样<b>不会 sleep 阻塞
+ *       listener 线程</b>，延迟由 MQ 承担；</li>
  *   <li>达到上限：先可靠发布到死信队列（等待 Publisher Confirm），成功后才 ACK 原消息，
  *       避免死信副本丢失。</li>
  * </ul>
+ * <p>
+ * pairVersion 持久化保护允许消息在不同重试轮次中乱序到达。
  * <p>
  * 通过 {@link ConditionalOnProperty} 限定只在 {@code community.like.mode=rabbitmq} 时启用。
  */
@@ -53,16 +57,22 @@ public class RabbitMqLikeBatchConsumer {
 
     /** JSON 反序列化器，用于把消息 body 解析为 {@link RedisLikeEvent} */
     @Resource private ObjectMapper objectMapper;
+
     /** 持久化服务：负责把事件批量/单条写入 MySQL（方法上有事务注解） */
     @Resource private RabbitMqLikePersistenceService persistenceService;
-    /** 发布器：负责把原始消息可靠投递到死信交换机（等待 Confirm） */
+
+    /** 发布器：负责主队列发布、延迟重试发布、死信复制（均等待 Confirm） */
     @Resource private RabbitMqLikePublisher publisher;
-    /** 点赞 MQ 配置：队列名、最大重试次数、退避基数、死信交换机等 */
+
+    /** 点赞 MQ 配置：队列名、最大重试次数、重试基础延迟、死信交换机等 */
     @Resource private RabbitMqLikeProperties properties;
+
     /** 运行时指标：批次大小、处理耗时、失败次数、重试次数、死信数等 */
     @Resource private RabbitMqLikeRuntimeMetrics metrics;
+
     /** 点赞专用 Redis 模板（按 Bean 名注入，与全局模板隔离） */
     @Resource(name = "likeStringRedisTemplate") private StringRedisTemplate redisTemplate;
+
     /** 点赞 Redis 配置：提供 key 前缀，用于拼装重试计数 key */
     @Resource private LikeRedisProperties redisProperties;
 
@@ -89,15 +99,16 @@ public class RabbitMqLikeBatchConsumer {
         metrics.beginBatch(size);
         try {
             List<RedisLikeEvent> events = decodeBatch(messages);
-            // persistBatch 是 Spring 事务代理调用；正常返回代表整批 MySQL 事务已经提交。
-            persistenceService.persistBatch(events);
+            // persistWithMetrics 内部调用事务代理；正常返回代表整批 MySQL 事务已经提交。
+            persistWithMetrics(events);
+            // 整批成功：一次性 ACK 整批
             channel.basicAck(lastTag, true);
-            // 整批成功，清理每条事件的重试计数（避免后续同 eventId 重投时误判为已重试）
+            // 清理每条事件的重试计数，避免后续同 eventId 重投时误判为已重试
             for (RedisLikeEvent event : events) clearRetryCount(event.getEventId());
             metrics.recordProcessed(size, System.nanoTime() - started);
         } catch (Exception batchFailure) {
             metrics.recordFailure();
-            log.warn("RabbitMQ like batch transaction failed; falling back to ordered single-event processing. size={}",
+            log.warn("RabbitMQ like batch transaction failed; switching to ordered per-message fallback. size={}",
                     size, batchFailure);
             // 批量事务失败已整体回滚。逐条事务可隔离坏消息，且遇到失败时不让后续事件越过它。
             processBatchFallback(messages, channel, lastTag, started);
@@ -137,11 +148,15 @@ public class RabbitMqLikeBatchConsumer {
      * 处理策略：
      * <ul>
      *   <li>按原顺序逐条处理；成功则立即 ACK 单条（multiple=false）；</li>
-     *   <li>遇到失败事件：累加重试计数，未达上限则指数退避后 NACK "该事件及其后的未确认消息"
-     *       （{@code multiple=true}），确保顺序；</li>
-     *   <li>达到上限：先发布到死信队列并等待 Confirm，成功后 ACK 原消息；</li>
-     *   <li>重试计数器本身不可用（Redis 故障）时，保守地 NACK 整批未确认部分，
-     *       避免"无法计数却继续处理"造成消息丢失或无限重试。</li>
+     *   <li>遇到失败事件：累加重试计数：
+     *     <ul>
+     *       <li>未达上限：投递到<b>延迟重试队列</b>并等待 Confirm，成功后 ACK 原消息。
+     *           不 sleep，延迟由 Retry Queue 的 TTL + DLX 承担；</li>
+     *       <li>达到上限：先发布到死信队列并等待 Confirm，成功后 ACK 原消息；</li>
+     *     </ul>
+     *   </li>
+     *   <li>任何"投递未确认"或"重试计数器不可用"的情况，都 NACK 该事件及其后的未确认消息
+     *       （{@code multiple=true}），确保顺序且不丢消息。</li>
      * </ul>
      * <p>
      * 已 ACK 的前缀不会因后续 NACK 而回滚，这依赖 {@code multiple=true} 只作用于
@@ -161,14 +176,16 @@ public class RabbitMqLikeBatchConsumer {
             try {
                 RedisLikeEvent event = objectMapper.readValue(message.getBody(), RedisLikeEvent.class);
                 if (event.getEventId() == null || event.getEventId().trim().isEmpty()) {
-                    throw new IllegalArgumentException("消息缺少 eventId");
+                    throw new IllegalArgumentException("点赞消息缺少 eventId");
                 }
+                String headerId = message.getMessageProperties().getMessageId();
+                // 兼容没有 messageId header 的历史消息：解析成功后用 body.eventId 作为重试键。
+                if (headerId == null || headerId.trim().isEmpty()) stableId = event.getEventId();
                 // 逐条处理时同样校验头体一致，避免绕过批量阶段的校验
-                if (message.getMessageProperties().getMessageId() != null
-                        && !message.getMessageProperties().getMessageId().equals(event.getEventId())) {
+                if (headerId != null && !headerId.equals(event.getEventId())) {
                     throw new IllegalArgumentException("RabbitMQ messageId 与 body.eventId 不一致：" + stableId);
                 }
-                persistenceService.persistBatch(Collections.singletonList(event));
+                persistWithMetrics(Collections.singletonList(event));
                 channel.basicAck(deliveryTag, false);
                 clearRetryCount(event.getEventId());
                 persisted++;
@@ -178,26 +195,27 @@ public class RabbitMqLikeBatchConsumer {
                     attempts = incrementRetryCount(stableId);
                 } catch (RuntimeException retryStoreFailure) {
                     // 重试计数不可用（Redis 故障）：不能判断是否该进死信，保守重回未确认后缀。
-                    log.error("Retry counter in Redis unavailable; requeueing unacked batch to avoid losing messages", retryStoreFailure);
+                    log.error("Redis retry counter unavailable; requeueing unacked suffix", retryStoreFailure);
                     channel.basicNack(lastTag, true, true);
                     metrics.recordProcessed(persisted, System.nanoTime() - started);
                     return;
                 }
+
                 int maxAttempts = Math.max(1, properties.getMaxRetries());
                 if (attempts >= maxAttempts) {
                     try {
-                        // 发布副本并等待 Publisher Confirm；成功后才 ACK 原消息。
+                        // 发布死信副本并等待 Publisher Confirm；成功后才 ACK 原消息。
                         publisher.publishRaw(properties.getDeadExchange(), properties.getDeadRoutingKey(),
                                 message.getBody(), stableId, (int) Math.min(Integer.MAX_VALUE, attempts));
                         channel.basicAck(deliveryTag, false);
                         clearRetryCount(stableId);
                         metrics.recordDeadLettered();
-                        log.error("RabbitMQ like event moved to dead-letter queue after {} failures: eventId={}",
+                        log.error("Like event moved to dead-letter queue after {} failures: eventId={}",
                                 attempts, stableId, eventFailure);
                         continue;
                     } catch (Exception deadLetterFailure) {
                         // 死信副本未确认：不能 ACK 原消息，否则可能永久丢失事件。
-                        log.error("Could not confirm dead-letter copy; requeue the unacked suffix. eventId={}",
+                        log.error("Dead-letter publish was not confirmed; requeueing unacked suffix. eventId={}",
                                 stableId, deadLetterFailure);
                         channel.basicNack(lastTag, true, true);
                         metrics.recordProcessed(persisted, System.nanoTime() - started);
@@ -206,22 +224,52 @@ public class RabbitMqLikeBatchConsumer {
                 }
 
                 metrics.recordRetryAttempt();
-                long delay = retryDelayMs(attempts);
-                log.warn("RabbitMQ like event failed; requeue this event and the unacked suffix to preserve order. " +
-                                "eventId={}, attempt={}/{}, backoffMs={}",
-                        stableId, attempts, maxAttempts, delay, eventFailure);
                 try {
-                    Thread.sleep(delay);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
+                    // 固定短延迟，避免指数 TTL 在单个 retry queue 中形成长消息阻塞。
+                    // 延迟由 Retry Queue 的 TTL 承担，listener 线程不 sleep。
+                    long delayMs = Math.max(100L, properties.getRetryBaseDelayMs());
+                    publisher.publishRetryRaw(message.getBody(), stableId,
+                            (int) Math.min(Integer.MAX_VALUE, attempts), delayMs);
+                    // 只有 retry queue 收到 Confirm 后才能确认原消息。
+                    channel.basicAck(deliveryTag, false);
+                    log.warn("Like event sent to delayed retry queue: eventId={}, attempt={}/{}, delayMs={}",
+                            stableId, attempts, maxAttempts, delayMs, eventFailure);
+                } catch (Exception retryPublishFailure) {
+                    // 延迟重试消息未确认：不能 ACK 原消息，重新入队未确认后缀。
+                    log.error("Retry publish was not confirmed; requeueing unacked suffix. eventId={}",
+                            stableId, retryPublishFailure);
+                    channel.basicNack(lastTag, true, true);
+                    metrics.recordProcessed(persisted, System.nanoTime() - started);
+                    return;
                 }
-                // Previous events in the batch have individual ACKs; multiple=true only requeues remaining unacked tags.
-                channel.basicNack(lastTag, true, true);
-                metrics.recordProcessed(persisted, System.nanoTime() - started);
-                return;
             }
         }
         metrics.recordProcessed(persisted, System.nanoTime() - started);
+    }
+
+    /**
+     * 执行持久化并单独统计 MySQL 耗时。
+     * <p>
+     * 将 MySQL 持久化耗时与整个 Rabbit listener callback 耗时分开统计，
+     * 便于定位瓶颈（DB 慢 vs MQ/序列化慢）。
+     * <p>
+     * 异常处理：持久化抛 RuntimeException 时记录 {@code recordPersistenceFailure}，
+     * 然后原样抛出，由上层（批量或逐条）决定降级策略。
+     * <p>
+     * {@code finally} 中记录耗时，确保失败路径也能统计到持久化开销。
+     *
+     * @param events 待持久化的事件（批量或单条）
+     */
+    private void persistWithMetrics(List<RedisLikeEvent> events) {
+        long started = System.nanoTime();
+        try {
+            persistenceService.persistBatch(events);
+        } catch (RuntimeException exception) {
+            metrics.recordPersistenceFailure();
+            throw exception;
+        } finally {
+            metrics.recordPersistence(System.nanoTime() - started);
+        }
     }
 
     /**
@@ -246,7 +294,7 @@ public class RabbitMqLikeBatchConsumer {
             for (byte b : digest) out.append(String.format("%02x", b & 0xff));
             return out.toString();
         } catch (NoSuchAlgorithmException impossible) {
-            return "malformed-" + UUID.nameUUIDFromBytes(message.getBody()).toString();
+            return "malformed-" + UUID.nameUUIDFromBytes(message.getBody());
         }
     }
 
@@ -255,13 +303,15 @@ public class RabbitMqLikeBatchConsumer {
      * <p>
      * key 结构：{@code {keyPrefix}:mq:retry-counts}，field 为稳定消息 ID。
      * 使用 HINCRBY 保证并发消费时的计数原子性。
+     * <p>
+     * 注意：返回值 {@code null} 时兜底为 1，避免 Redis 客户端异常返回空值导致 NPE。
      *
-     * @param eventId 稳定消息 ID
+     * @param messageId 稳定消息 ID
      * @return 本次递增后的计数（至少为 1）
      */
-    private long incrementRetryCount(String eventId) {
+    private long incrementRetryCount(String messageId) {
         String key = redisProperties.getKeyPrefix() + ":mq:retry-counts";
-        Long count = redisTemplate.opsForHash().increment(key, eventId, 1L);
+        Long count = redisTemplate.opsForHash().increment(key, messageId, 1L);
         return count == null ? 1L : count;
     }
 
@@ -272,38 +322,15 @@ public class RabbitMqLikeBatchConsumer {
      * 不应因为清理异常而把已提交并 ACK 的事件重新判为失败，
      * 因此这里只记录 warn 日志，不向上抛出。
      *
-     * @param eventId 稳定消息 ID（可为空，空则跳过）
+     * @param messageId 稳定消息 ID（可为空，空则跳过）
      */
-    private void clearRetryCount(String eventId) {
-        if (eventId == null || eventId.trim().isEmpty()) return;
+    private void clearRetryCount(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) return;
         try {
-            redisTemplate.opsForHash().delete(redisProperties.getKeyPrefix() + ":mq:retry-counts", eventId);
-        } catch (RuntimeException e) {
-            // Retry counter 清理只影响后续重复事件的重试预算，不应把已提交并 ACK 的事件重新判为失败。
-            log.warn("Could not clear completed like retry counter: eventId={}", eventId, e);
+            redisTemplate.opsForHash().delete(redisProperties.getKeyPrefix() + ":mq:retry-counts", messageId);
+        } catch (RuntimeException exception) {
+            // 清理失败不应把已提交并 ACK 的事件重新判为失败。
+            log.warn("Could not clear completed like retry counter: eventId={}", messageId, exception);
         }
-    }
-
-    /**
-     * 计算指数退避延迟（毫秒）。
-     * <p>
-     * 公式：{@code min(cap, base * 2^(attempt-1))}，其中：
-     * <ul>
-     *   <li>base 下限 10ms（防止配置为 0 导致忙等）；</li>
-     *   <li>指数上限 20（防止移位溢出）；</li>
-     *   <li>总延迟上限 30s（防止长时间阻塞消费线程）。</li>
-     * </ul>
-     * 使用乘法前先判断 {@code base > cap / multiplier} 防止溢出。
-     *
-     * @param attempt 当前失败次数（从 1 开始）
-     * @return 退避毫秒数
-     */
-    private long retryDelayMs(long attempt) {
-        long base = Math.max(10L, properties.getRetryBaseDelayMs());
-        int exponent = (int) Math.min(20L, Math.max(0L, attempt - 1L));
-        long multiplier = 1L << exponent;
-        long cap = 30000L;
-        if (base > cap / multiplier) return cap;
-        return Math.min(cap, base * multiplier);
     }
 }

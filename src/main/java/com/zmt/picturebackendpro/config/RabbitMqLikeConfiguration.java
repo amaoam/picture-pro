@@ -70,6 +70,22 @@ public class RabbitMqLikeConfiguration {
                 .with(p.getDeadRoutingKey());
     }
 
+    /** 消息在该队列中等待 message expiration，过期后由 DLX 自动回到主队列。 */
+    @Bean
+    public Queue communityLikeRetryQueue(RabbitMqLikeProperties p) {
+        return QueueBuilder.durable(p.getRetryQueue())
+                .withArgument("x-dead-letter-exchange", p.getExchange())
+                .withArgument("x-dead-letter-routing-key", p.getRoutingKey())
+                .build();
+    }
+
+    @Bean
+    public Binding communityLikeRetryBinding(@Qualifier("communityLikeRetryQueue") Queue queue,
+                                             @Qualifier("communityLikeRetryExchange") DirectExchange exchange,
+                                             RabbitMqLikeProperties p) {
+        return BindingBuilder.bind(queue).to(exchange).with(p.getRetryRoutingKey());
+    }
+
     @Bean(name = "communityLikeBatchListenerContainerFactory")
     public SimpleRabbitListenerContainerFactory communityLikeBatchListenerContainerFactory(
             ConnectionFactory connectionFactory, RabbitMqLikeProperties p) {

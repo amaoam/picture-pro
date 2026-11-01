@@ -1,6 +1,5 @@
 package com.zmt.picturebackendpro.service.impl.mq;
 
-import com.rabbitmq.client.AMQP;
 import com.zmt.picturebackendpro.config.RabbitMqLikeProperties;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
@@ -28,13 +27,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>
  * 指标语义说明：
  * <ul>
- *   <li><b>queue.depth</b>：仅统计 <i>ready</i> 消息数（未被投递给消费者的），
- *       不包含 unacked/in-flight 的消息；</li>
- *   <li><b>inflight</b>：当前 consumer callback 内正在处理的消息数（即已投递给消费者但尚未 ACK 的）；</li>
+ *   <li><b>queue.depth / retry.depth / dead.depth</b>：仅统计 <i>ready</i> 消息数
+ *       （未被投递给消费者的），不包含 unacked/in-flight 的消息；</li>
+ *   <li><b>inflight</b>：当前 consumer callback 内正在处理的消息数
+ *       （已投递给消费者但尚未 ACK 的）；</li>
  *   <li><b>last_completed_epoch_ms</b>：最近一次 consumer callback 结束的时间戳；
  *       结合 queue.depth 与 inflight 可以解释"批量缓冲/消费中的消息"，
  *       避免仅凭 ready 数误判链路是否安静。</li>
  * </ul>
+ * <p>
+ * 与消费者实现的配套关系：本类额外提供持久化耗时/失败指标与重试队列深度 Gauge，
+ * 与使用 {@code persistWithMetrics} 和延迟重试队列（{@code publishRetryRaw}）的
+ * 批量消费者配套使用。
  * <p>
  * 通过 {@link ConditionalOnProperty} 限定只在 {@code community.like.mode=rabbitmq} 时装配。
  */
@@ -42,9 +46,10 @@ import java.util.concurrent.atomic.AtomicLong;
 @ConditionalOnProperty(name = "community.like.mode", havingValue = "rabbitmq")
 public class RabbitMqLikeRuntimeMetrics {
 
-    /** RabbitAdmin 用于查询队列的 ready 消息数（被动声明，不修改队列） */
+    /** RabbitAdmin 用于查询队列的 ready 消息数（被动查询，不修改队列） */
     private final RabbitAdmin rabbitAdmin;
-    /** 点赞 MQ 配置：提供主队列名与死信队列名，用于注册队列深度 Gauge */
+
+    /** 点赞 MQ 配置：提供主队列、重试队列、死信队列名，用于注册队列深度 Gauge */
     private final RabbitMqLikeProperties properties;
 
     /**
@@ -64,14 +69,30 @@ public class RabbitMqLikeRuntimeMetrics {
 
     /** 已成功持久化并 ACK 的消息总数（按消息条数计，非批次数） */
     private final Counter processedMessages;
+
     /** 批量事务失败次数（每次失败会触发降级逐条处理） */
     private final Counter batchFailures;
-    /** 事件级重试次数（逐条降级中每次失败累加） */
+
+    /** 事件级重试次数（逐条降级中每次失败累加，消息随后投递到延迟重试队列） */
     private final Counter retryAttempts;
+
     /** 达到最大失败次数、已复制到死信队列的消息数 */
     private final Counter deadLetteredMessages;
-    /** 批次处理耗时（包含 MySQL 事务与 ACK） */
+
+    /** MySQL 持久化失败次数（事务回滚或抛异常） */
+    private final Counter persistenceFailures;
+
+    /**
+     * 整个 consumer callback 的耗时（包含批量/逐条处理、降级、重试与死信交接）。
+     * 使用 {@code publishPercentileHistogram()} 以便观测耗时分布。
+     */
     private final Timer batchDuration;
+
+    /**
+     * 仅 MySQL 事务持久化服务的耗时（不含 MQ 发送、ACK、降级逻辑）。
+     * 与 {@link #batchDuration} 分开统计，便于区分"DB 慢"与"MQ/序列化慢"。
+     */
+    private final Timer persistenceDuration;
 
     /**
      * 构造器：一次性注册所有指标。
@@ -80,13 +101,15 @@ public class RabbitMqLikeRuntimeMetrics {
      * 因此可以实时反映最新值，无需重复注册。
      *
      * @param rabbitAdmin RabbitAdmin（用于队列深度查询）
-     * @param properties  点赞 MQ 配置（提供队列名）
+     * @param properties  点赞 MQ 配置（提供主/重试/死信队列名）
      * @param registry    Micrometer 注册表
      */
     public RabbitMqLikeRuntimeMetrics(RabbitAdmin rabbitAdmin, RabbitMqLikeProperties properties,
                                       MeterRegistry registry) {
         this.rabbitAdmin = rabbitAdmin;
         this.properties = properties;
+
+        // ---- 计数器 ----
         this.processedMessages = Counter.builder("community.like.rabbitmq.consumer.messages")
                 .description("RabbitMQ like events successfully persisted and ACKed")
                 .register(registry);
@@ -94,24 +117,39 @@ public class RabbitMqLikeRuntimeMetrics {
                 .description("RabbitMQ like batch processing failures")
                 .register(registry);
         this.retryAttempts = Counter.builder("community.like.rabbitmq.consumer.retry_attempts")
-                .description("RabbitMQ like event retry attempts")
+                .description("RabbitMQ like events sent to delayed retry queue")
                 .register(registry);
         this.deadLetteredMessages = Counter.builder("community.like.rabbitmq.consumer.dead_lettered")
-                .description("RabbitMQ like messages copied to the dead-letter queue after max failures")
+                .description("RabbitMQ like messages confirmed in the dead-letter queue")
                 .register(registry);
+        this.persistenceFailures = Counter.builder("community.like.rabbitmq.consumer.persistence.failures")
+                .description("MySQL like persistence invocations that rolled back or failed")
+                .register(registry);
+
+        // ---- 计时器 ----
+        // batchDuration：整个 callback 的耗时，开启直方图以观测 P50/P90/P99 分布
         this.batchDuration = Timer.builder("community.like.rabbitmq.consumer.batch.duration")
-                .description("MySQL transaction and acknowledgement batch duration")
+                .description("Whole consumer callback duration, including fallback and retry/dead-letter handoff")
+                .publishPercentileHistogram()
                 .register(registry);
-        // Gauge 直接读取原子字段，反映实时值
+        // persistenceDuration：仅 MySQL 事务耗时，同样开启直方图
+        this.persistenceDuration = Timer.builder("community.like.rabbitmq.consumer.persistence.duration")
+                .description("Time spent inside the transactional MySQL persistence service only")
+                .publishPercentileHistogram()
+                .register(registry);
+
+        // ---- Gauge：直接读取原子字段，反映实时值 ----
         Gauge.builder("community.like.rabbitmq.consumer.inflight", inFlight, AtomicInteger::get)
-                .description("Messages inside the current consumer callback")
+                .description("Messages inside active consumer callbacks")
                 .register(registry);
         Gauge.builder("community.like.rabbitmq.consumer.last_completed_epoch_ms", lastConsumerCompletedAtMs, AtomicLong::get)
-                .description("Epoch milliseconds when the last consumer batch completed")
+                .description("Epoch milliseconds when the last consumer callback completed")
                 .register(registry);
-        // 主队列与死信队列的 ready 深度 Gauge
+
+        // ---- Gauge：主队列、重试队列、死信队列的 ready 深度 ----
         registerQueueGauge(registry, "community.like.rabbitmq.queue.depth", properties.getQueue());
         registerQueueGauge(registry, "community.like.rabbitmq.dead.depth", properties.getDeadQueue());
+        registerQueueGauge(registry, "community.like.rabbitmq.retry.depth", properties.getRetryQueue());
     }
 
     /**
@@ -124,12 +162,12 @@ public class RabbitMqLikeRuntimeMetrics {
      * 便于监控告警区分"真实为空"与"查询失败"。
      *
      * @param registry Micrometer 注册表
-     * @param name     Gauge 名称
-     * @param queue    队列名
+     * @param metricName Gauge 名称
+     * @param queueName  队列名
      */
-    private void registerQueueGauge(MeterRegistry registry, String name, String queue) {
-        Gauge.builder(name, this, metrics -> metrics.queueDepth(queue))
-                .description("Ready messages in RabbitMQ queue " + queue + "; -1 means query unavailable")
+    private void registerQueueGauge(MeterRegistry registry, String metricName, String queueName) {
+        Gauge.builder(metricName, this, metrics -> metrics.queueDepth(queueName))
+                .description("Ready messages in RabbitMQ queue " + queueName + "; -1 means unavailable")
                 .register(registry);
     }
 
@@ -148,26 +186,42 @@ public class RabbitMqLikeRuntimeMetrics {
      */
     public int queueDepth(String queue) {
         try {
-            Properties p = rabbitAdmin.getQueueProperties(queue);
-            if (p == null) return -1;
-            Object count = p.get(RabbitAdmin.QUEUE_MESSAGE_COUNT);
-            return count instanceof Number ? ((Number) count).intValue() : -1;
-        } catch (RuntimeException e) {
+            Properties queueProperties = rabbitAdmin.getQueueProperties(queue);
+            if (queueProperties == null) return -1;
+            Object value = queueProperties.get(RabbitAdmin.QUEUE_MESSAGE_COUNT);
+            return value instanceof Number ? ((Number) value).intValue() : -1;
+        } catch (RuntimeException exception) {
+            // 采集失败不向上抛出，避免影响监控采集线程或业务线程
             return -1;
         }
     }
 
     /**
-     * 判断主队列与死信队列是否都为空（ready 数均为 0）。
+     * 判断主队列是否为空（ready 数为 0）。
      * <p>
-     * 注意：此方法只反映 ready 消息；还需结合 {@link #inFlight()} 与
-     * {@link #lastConsumerCompletedAtMs()} 才能完整判断链路是否安静。
-     * 对账服务 {@code isSafeWindow} 会同时使用这三者。
+     * 对账只需要主队列 Ready 为空；重试/DLQ 中的旧版本会由 pairVersion fence 保护，
+     * 因此这里不把 retry/DLQ 纳入判断，避免旧版本残留导致对账窗口长期不可用。
      *
-     * @return true 表示两个队列的 ready 消息数都为 0
+     * @return true 表示主队列 ready 消息数为 0
+     */
+    public boolean mainQueueEmpty() {
+        return queueDepth(properties.getQueue()) == 0;
+    }
+
+    /**
+     * 判断主队列、延迟重试队列、死信队列是否都为空（ready 数均为 0）。
+     * <p>
+     * 保留全链路空判断，供人工诊断使用；它比 {@link #mainQueueEmpty()} 更严格，
+     * 包含主队列、延迟重试队列和死信队列。
+     * <p>
+     * 注意：此方法只反映 ready 消息；完整判断链路是否安静还需结合
+     * {@link #inFlight()} 与 {@link #lastConsumerCompletedAtMs()}。
+     *
+     * @return true 表示三个队列的 ready 消息数都为 0
      */
     public boolean allQueuesEmpty() {
         return queueDepth(properties.getQueue()) == 0
+                && queueDepth(properties.getRetryQueue()) == 0
                 && queueDepth(properties.getDeadQueue()) == 0;
     }
 
@@ -205,19 +259,34 @@ public class RabbitMqLikeRuntimeMetrics {
      * <p>
      * 在批量事务成功 ACK 后，或逐条降级完成后调用；
      * 每次调用累加 {@code count} 条消息并记录一次耗时样本。
+     * <p>
+     * {@code count <= 0} 时不向 Counter 累加，避免传入非法值。
      *
      * @param count 本次成功处理的消息数
      * @param nanos 本次处理耗时（纳秒）
      */
     public void recordProcessed(int count, long nanos) {
-        processedMessages.increment(count);
+        if (count > 0) processedMessages.increment(count);
         batchDuration.record(nanos, TimeUnit.NANOSECONDS);
     }
 
     /** 记录一次批量事务失败（触发逐条降级）。 */
     public void recordFailure() { batchFailures.increment(); }
 
-    /** 记录一次事件级重试（逐条降级中发生）。 */
+    /**
+     * 记录一次 MySQL 持久化耗时。
+     * <p>
+     * 由 {@code persistWithMetrics} 的 finally 调用，成功与失败路径都会记录，
+     * 便于定位 DB 慢查询。
+     *
+     * @param nanos 持久化耗时（纳秒）
+     */
+    public void recordPersistence(long nanos) { persistenceDuration.record(nanos, TimeUnit.NANOSECONDS); }
+
+    /** 记录一次 MySQL 持久化失败（事务回滚或抛异常）。 */
+    public void recordPersistenceFailure() { persistenceFailures.increment(); }
+
+    /** 记录一次事件级重试（消息已投递到延迟重试队列）。 */
     public void recordRetryAttempt() { retryAttempts.increment(); }
 
     /** 记录一条消息达到最大重试次数并已复制到死信队列。 */
