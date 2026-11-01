@@ -8,17 +8,17 @@ const TARGET_TYPE = (__ENV.TARGET_TYPE || 'POST').toUpperCase();
 const TARGET_MODE = (__ENV.TARGET_MODE || 'single').toLowerCase(); // single | multi | mixed
 const RATE = Number(__ENV.RATE || 10);
 const DURATION = __ENV.DURATION || '60s';
-const PRE_VUS = Number(__ENV.PRE_VUS || 50);
-const MAX_VUS = Number(__ENV.MAX_VUS || 100);
+const PRE_VUS = Number(__ENV.PRE_VUS || 200);
+const MAX_VUS = Number(__ENV.MAX_VUS || 400);
 const HOT_RATIO = Math.max(0, Math.min(1, Number(__ENV.HOT_RATIO || 0.8)));
 const SESSION_COOKIE_NAME = __ENV.SESSION_COOKIE_NAME || 'satoken';
 const businessFailures = new Rate('business_failures');
 
 // 只在测试机本地放置真实压测账号；不要把 users.local.json 提交到仓库。
 const credentials = new SharedArray('load-test-credentials', function () {
-  return JSON.parse(open(__ENV.USERS_FILE || './k6/users.local.json'));
+  return JSON.parse(open(__ENV.USERS_FILE || './users.local.json'));
 });
-const targetConfig = JSON.parse(open(__ENV.TARGETS_FILE || './k6/targets.local.json'));
+const targetConfig = JSON.parse(open(__ENV.TARGETS_FILE || './targets.local.json'));
 
 export const options = {
   setupTimeout: __ENV.SETUP_TIMEOUT || '5m',

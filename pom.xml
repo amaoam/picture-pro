@@ -21,6 +21,7 @@
         <spring-boot.version>2.7.6</spring-boot.version>
     </properties>
     
+    
 
     <dependencies>
         <!-- 高性能无锁队列 -->
@@ -29,6 +30,12 @@
             <artifactId>disruptor</artifactId>
             <version>3.4.2</version>
         </dependency>
+<!--        消息队列-->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+
         <!-- websocket -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -26,7 +26,20 @@ spring:
   session:
     store-type: redis
     timeout: 2592000 # 会话过期30天
-
+  rabbitmq:
+    dynamic: true
+    host: ${RABBITMQ_HOST:127.0.0.1}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    
+    template:
+      mandatory: true
+  
 # MyBatis-Plus 配置
 mybatis-plus:
   configuration:
@@ -86,15 +99,75 @@ community:
       poll-jitter-percent: 10
       initial-worker-stagger-ms: 25
       # target-batch-size、max-events-per-target、max-retries 保留 V2.1 的原值
+    # database 为默认安全模式；完成 Redis 导入和验证后，维护窗口切到 redis-stream。
+#    mode: redis-stream
+#    redis:
+#      # 独立连接，不会覆盖用于 Spring Session 的 spring.redis.*。本机 compose 默认端口 6380。
+#      host: 127.0.0.1
+#      port: 6380
+#      database: 0
+#      password: ""
+#      command-timeout-ms: 2000
+#      key-prefix: picture:like:v3
+#      # 必须与 scripts/bootstrap_redis_like_state.py 的 --shards 参数一致。
+#      shard-count: 16
+#      consumer-group: community-like-persist-v3
+#      # 每个分片固定一个 worker；初版不支持多个应用副本并发消费相同分片。
+#      batch-size: 100
+#      read-block-ms: 100
+#      idle-min-delay-ms: 10
+#      idle-max-delay-ms: 250
+#      error-min-delay-ms: 100
+#      error-max-delay-ms: 2000
+#      idempotency-ttl-seconds: 86400
+#      # 失败达到阈值仅用于加重日志告警；不会跳过消息，保护同目标事件顺序。
+#      repeated-error-warning-threshold: 5
+    mode: rabbitmq
+  redis:
+    host: 127.0.0.1
+    port: 6380
+    database: 0
+    password: ""
+    key-prefix: picture:like:rabbitmq:v1
+    shard-count: 16
+    idempotency-ttl-seconds: 86400
+  rabbitmq:
+    exchange: community.like.exchange.v1
+    queue: community.like.commands.v1
+    routing-key: community.like.command.v1
+    dead-exchange: community.like.dead.exchange.v1
+    dead-queue: community.like.commands.dead.v1
+    dead-routing-key: community.like.dead.v1
+    relay-group: community-like-rabbitmq-relay-v1
+    relay-consumer: community-like-rabbitmq-relay-0
+    relay-batch-size: 100
+    relay-poll-delay-ms: 10
+    publisher-confirm-timeout-ms: 5000
+    consumer-batch-size: 100
+    consumer-receive-timeout-ms: 50
+    consumer-prefetch: 100
+    metadata-cache-ttl-ms: 3000
+    metadata-cache-max-size: 100000
+    max-retries: 8
+    retry-base-delay-ms: 1000
+    reconcile-initial-delay-ms: 120000
+    reconcile-interval-ms: 300000
+    quiet-period-ms: 30000
 # Spring Boot Actuator / Prometheus。生产环境应通过网络策略限制这些端点的访问。
 management:
   endpoints:
     web:
       exposure:
         include: health,info,metrics,prometheus
+
+  health:
+    rabbit:
+      enabled: true
+
   endpoint:
     health:
       show-details: never
+      show-components: always
   metrics:
     distribution:
       percentiles-histogram:

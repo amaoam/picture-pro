@@ -30,7 +30,7 @@ import java.util.regex.Pattern;
  * 2. MySQL 的持久化解耦，由 Redis Stream 消费者异步完成。
  * 3. 仅通过 MySQL 读取目标元数据（如帖子、图片）以进行公开状态校验及自赞防刷校验，切勿在此处调用旧的数据库点赞写方法。
  * </p>
- *
+ *使用 {@link Primary} 确保在 rabbitmq 模式下优先注入本实现。
  * @author zmt
  */
 @Slf4j
