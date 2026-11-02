@@ -496,6 +496,7 @@ function Test-ApiPreflight {
         "community_like_rabbitmq_relay_stream_entries",
         "community_like_rabbitmq_relay_stream_pending",
         "community_like_rabbitmq_queue_depth",
+        "community_like_rabbitmq_retry_depth",
         "community_like_rabbitmq_dead_depth",
         "community_like_rabbitmq_consumer_inflight"
     )
@@ -691,6 +692,7 @@ function Wait-MqBacklogDrain {
         "community_like_rabbitmq_relay_stream_entries",
         "community_like_rabbitmq_relay_stream_pending",
         "community_like_rabbitmq_queue_depth",
+        "community_like_rabbitmq_retry_depth",
         "community_like_rabbitmq_dead_depth",
         "community_like_rabbitmq_consumer_inflight"
     )
@@ -719,9 +721,19 @@ function Wait-MqBacklogDrain {
         }
         if ($values["community_like_rabbitmq_dead_depth"] -gt 0) {
             Write-CsvRow -Path (Join-Path $script:CurrentRunDir "drain-check.csv") -Row ([pscustomobject]@{
-                timestamp_utc = [DateTime]::UtcNow.ToString("o"); run_id = $RunId; stable_samples = $stable; ready = $false
-                stream_entries = $values[$metricNames[0]]; stream_pending = $values[$metricNames[1]]; queue_depth = $values[$metricNames[2]]
-                dead_depth = $values[$metricNames[3]]; consumer_inflight = $values[$metricNames[4]]; note = "dead_queue_non_empty"
+                timestamp_utc = [DateTime]::UtcNow.ToString("o")
+                run_id = $RunId
+                stable_samples = $stable
+                ready = $false
+
+                stream_entries = $values["community_like_rabbitmq_relay_stream_entries"]
+                stream_pending = $values["community_like_rabbitmq_relay_stream_pending"]
+                queue_depth = $values["community_like_rabbitmq_queue_depth"]
+                retry_depth = $values["community_like_rabbitmq_retry_depth"]
+                dead_depth = $values["community_like_rabbitmq_dead_depth"]
+                consumer_inflight = $values["community_like_rabbitmq_consumer_inflight"]
+
+                note = "dead_queue_non_empty"
             })
             return [pscustomobject]@{ success = $false; reason = "dead_queue_non_empty"; seconds = (New-TimeSpan -Start $drainStart -End (Get-Date)).TotalSeconds; after_metrics = $map }
         }
@@ -730,12 +742,29 @@ function Wait-MqBacklogDrain {
         if ($allZero) { $stable++ } else { $stable = 0 }
         $note = if ($allZero) { "all_zero" } else { "backlog_remaining" }
         Write-CsvRow -Path (Join-Path $script:CurrentRunDir "drain-check.csv") -Row ([pscustomobject]@{
-            timestamp_utc = [DateTime]::UtcNow.ToString("o"); run_id = $RunId; stable_samples = $stable; ready = ($stable -ge $script:DrainStableSamples)
-            stream_entries = $values[$metricNames[0]]; stream_pending = $values[$metricNames[1]]; queue_depth = $values[$metricNames[2]]
-            dead_depth = $values[$metricNames[3]]; consumer_inflight = $values[$metricNames[4]]; note = $note
+            timestamp_utc = [DateTime]::UtcNow.ToString("o")
+            run_id = $RunId
+            stable_samples = $stable
+            ready = ($stable -ge $script:DrainStableSamples)
+
+            stream_entries = $values["community_like_rabbitmq_relay_stream_entries"]
+            stream_pending = $values["community_like_rabbitmq_relay_stream_pending"]
+            queue_depth = $values["community_like_rabbitmq_queue_depth"]
+            retry_depth = $values["community_like_rabbitmq_retry_depth"]
+            dead_depth = $values["community_like_rabbitmq_dead_depth"]
+            consumer_inflight = $values["community_like_rabbitmq_consumer_inflight"]
+
+            note = $note
         })
-        Write-Host ("stable={0}/{1}, streamEntries={2}, streamPending={3}, queue={4}, dead={5}, inFlight={6}" -f `
-            $stable, $script:DrainStableSamples, $values[$metricNames[0]], $values[$metricNames[1]], $values[$metricNames[2]], $values[$metricNames[3]], $values[$metricNames[4]])
+        Write-Host ("stable={0}/{1}, streamEntries={2}, streamPending={3}, queue={4}, retry={5}, dead={6}, inFlight={7}" -f `
+    $stable,
+        $script:DrainStableSamples,
+        $values["community_like_rabbitmq_relay_stream_entries"],
+        $values["community_like_rabbitmq_relay_stream_pending"],
+        $values["community_like_rabbitmq_queue_depth"],
+        $values["community_like_rabbitmq_retry_depth"],
+        $values["community_like_rabbitmq_dead_depth"],
+        $values["community_like_rabbitmq_consumer_inflight"])
         if ($stable -ge $script:DrainStableSamples) {
             $seconds = (New-TimeSpan -Start $drainStart -End (Get-Date)).TotalSeconds
             return [pscustomobject]@{ success = $true; reason = "drained"; seconds = [math]::Round($seconds, 2); after_metrics = $map }

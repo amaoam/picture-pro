@@ -17,9 +17,9 @@ const businessFailures = new Rate('business_failures');
 
 // 这些 JSON 只在本机保存；不要把用户密码或真实 targets.local.json 提交到 Git。
 const credentials = new SharedArray('mq-load-test-credentials', function () {
-  return JSON.parse(open(__ENV.USERS_FILE || './k6/users.local.json'));
+  return JSON.parse(open(__ENV.USERS_FILE || './users.local.json'));
 });
-const targetConfig = JSON.parse(open(__ENV.TARGETS_FILE || './k6/targets.local.json'));
+const targetConfig = JSON.parse(open(__ENV.TARGETS_FILE || './targets.local.json'));
 
 export const options = {
   setupTimeout: __ENV.SETUP_TIMEOUT || '5m',

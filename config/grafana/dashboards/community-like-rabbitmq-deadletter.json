@@ -1,0 +1,67 @@
+﻿{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "死信队列当前积压（Ready）",
+      "description": "当前还留在 RabbitMQ 死信队列中的消息数。审计消费者写库后会 ACK，因此该值会回落到 0；它不是历史累计死信数。",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "community_like_rabbitmq_dead_depth{job=\"picture-backend\"}", "legendFormat": "ready" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "orientation": "auto", "textMode": "value", "colorMode": "value", "graphMode": "area", "justifyMode": "auto" }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "最近 5 分钟新增死信（确认发布）",
+      "description": "以 Publisher Confirm 成功为统计口径；每个死信发布动作计数一次。",
+      "gridPos": { "x": 8, "y": 0, "w": 16, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "increase(community_like_rabbitmq_dead_letter_published_total{job=\"picture-backend\"}[5m])", "legendFormat": "published" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "showPoints": "always" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "最近 5 分钟死信审计入库数",
+      "description": "审计消费者成功写入 community_like_dead_letter_audit 并 ACK 后计数。",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "increase(community_like_rabbitmq_dead_letter_audit_persisted_total{job=\"picture-backend\"}[5m])", "legendFormat": "audit persisted" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "showPoints": "always" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "最近 5 分钟死信审计失败数",
+      "description": "审计数据库写入或死信 ACK 失败；若持续增长，检查数据库连接和审计表迁移。",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "increase(community_like_rabbitmq_dead_letter_audit_failures_total{job=\"picture-backend\"}[5m])", "legendFormat": "audit failures" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "showPoints": "always" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single" } }
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["community-like", "rabbitmq", "dead-letter"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "Community Like - RabbitMQ Dead Letter",
+  "uid": "community-like-rabbitmq-dlq",
+  "version": 1
+}
