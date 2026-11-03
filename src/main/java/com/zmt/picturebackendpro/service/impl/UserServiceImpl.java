@@ -163,8 +163,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
         }
         // 从数据库中查询（追求性能的话可以注释，直接返回上述结果）
-        Long userId = currentUser.getId();
-        currentUser = this.baseMapper.selectById(userId);
+//        Long userId = currentUser.getId();
+//        currentUser = this.baseMapper.selectById(userId);
         return currentUser;
     }
 

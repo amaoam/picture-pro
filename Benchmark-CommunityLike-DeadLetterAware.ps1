@@ -31,6 +31,26 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
+# 保存调用脚本前的 PowerShell 状态；本脚本会临时切换工作目录并设置 k6 环境变量。
+$script:ManagedEnvironmentVariables = @(
+    "BASE_URL", "TARGET_TYPE", "PRE_VUS", "MAX_VUS", "SESSION_COOKIE_NAME",
+    "USERS_FILE", "TARGETS_FILE", "SETUP_TIMEOUT", "REQUEST_TIMEOUT", "K6_NO_COLOR",
+    "TARGET_MODE", "HOT_RATIO", "RATE", "DURATION"
+)
+$script:EnvironmentSnapshot = @{}
+foreach ($environmentName in $script:ManagedEnvironmentVariables) {
+    $environmentPath = "Env:\$environmentName"
+    $script:EnvironmentSnapshot[$environmentName] = [pscustomobject]@{
+        Exists = (Test-Path $environmentPath)
+        Value = [Environment]::GetEnvironmentVariable($environmentName, "Process")
+    }
+}
+$script:LocationPushed = $false
+$script:FinalExitCode = 0
+$script:ActiveK6Process = $null
+$script:PendingDrain = $null
+$script:NeedsRepackageAfterCleanup = $false
+
 # ------------------------------
 # Helpers
 # ------------------------------
@@ -638,16 +658,27 @@ function Test-LoadMarkerInLogs {
 function Get-K6FallbackExitCode {
     param(
         [string]$SummaryPath,
-        [string]$StdoutPath
+        [string]$StdoutPath,
+        [string]$StderrPath
     )
 
-    # PowerShell 5.1 may fail to expose ExitCode for a Process object in some
-    # launcher/shim configurations. Infer only when k6 printed a complete
-    # TOTAL RESULTS section and all benchmark thresholds are evaluable.
-    if (-not (Test-Path $SummaryPath) -or -not (Test-Path $StdoutPath)) { return $null }
+    # 只有 k6 输出完整汇总且 summary 包含所有阈值指标时才推断退出码。
+    # stdout/stderr 都检查，避免不同启动方式导致汇总文本落在不同流中。
+    if (-not (Test-Path $SummaryPath)) { return $null }
 
-    $stdout = Get-Content -Raw -Path $StdoutPath
-    if ($stdout -notmatch "TOTAL RESULTS") { return $null }
+    $completeResultsFound = $false
+    foreach ($logPath in @($StdoutPath, $StderrPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($logPath) -and (Test-Path $logPath)) {
+            try {
+                if ((Get-Content -Raw -Path $logPath -ErrorAction Stop) -match "TOTAL RESULTS") {
+                    $completeResultsFound = $true
+                    break
+                }
+            }
+            catch { }
+        }
+    }
+    if (-not $completeResultsFound) { return $null }
 
     try {
         $summary = Get-Content -Raw -Path $SummaryPath | ConvertFrom-Json
@@ -655,20 +686,14 @@ function Get-K6FallbackExitCode {
         $httpFailureRate = Get-SummaryValue -Summary $summary -MetricNames @("http_req_failed{name:like_toggle}", "http_req_failed") -ValueName "value"
         $dropped = Get-SummaryValue -Summary $summary -MetricNames @("dropped_iterations") -ValueName "count"
         $p95 = Get-SummaryValue -Summary $summary -MetricNames @("http_req_duration{name:like_toggle}", "http_req_duration") -ValueName "p(95)"
-
-        $p99 = $null
-        if ($stdout -match 'p\(99\)=([0-9]+(?:\.[0-9]+)?)ms') {
-            $p99 = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
-        }
+        $p99 = Get-SummaryValue -Summary $summary -MetricNames @("http_req_duration{name:like_toggle}", "http_req_duration") -ValueName "p(99)"
 
         if ($null -eq $businessRate -or $null -eq $httpFailureRate -or
             $null -eq $dropped -or $null -eq $p95 -or $null -eq $p99) {
             return $null
         }
 
-        # These are the benchmark k6 thresholds in community_like_mq_benchmark.js:
-        # business_failures < 1%, http_req_failed < 1%, dropped_iterations == 0,
-        # like endpoint p95 < 500ms, like endpoint p99 < 1000ms.
+        # Keep these values aligned with community_like_mq_benchmark.js.
         $failed = ([double]$businessRate -ge 0.01) -or
                   ([double]$httpFailureRate -ge 0.01) -or
                   ([double]$dropped -gt 0) -or
@@ -822,6 +847,95 @@ function Wait-MqBacklogDrain {
         after_metrics = $lastMap
     }
 }
+function Invoke-PendingDrainCleanup {
+    param([string]$Reason = "unexpected_script_exit")
+
+    if ($null -eq $script:PendingDrain) { return $null }
+    $pending = $script:PendingDrain
+    $cleanupError = $null
+    $processStopped = $true
+
+    # 必须先确认 k6 停止，不能在它仍可能产生消息时开始排空检查。
+    if ($null -ne $script:ActiveK6Process) {
+        try {
+            $activeProcess = $script:ActiveK6Process
+            $activeProcess.Refresh()
+            if (-not $activeProcess.HasExited) {
+                Stop-Process -Id $activeProcess.Id -Force -ErrorAction Stop
+            }
+            if (-not $activeProcess.WaitForExit(30000)) {
+                Stop-Process -Id $activeProcess.Id -Force -ErrorAction SilentlyContinue
+                if (-not $activeProcess.WaitForExit(30000)) {
+                    throw "等待 k6 进程退出超时，PID=$($activeProcess.Id)"
+                }
+            }
+        }
+        catch {
+            $processStopped = $false
+            $cleanupError = "停止 k6 进程失败：$($_.Exception.Message)"
+        }
+        finally {
+            if ($processStopped) {
+                try { $script:ActiveK6Process.Dispose() } catch { }
+                $script:ActiveK6Process = $null
+            }
+        }
+    }
+
+    $drain = $null
+    if ($processStopped) {
+        try {
+            $script:CurrentRunDir = $pending.RunDir
+            $drain = Wait-MqBacklogDrain `
+                -RunId $pending.RunId `
+                -Mode $pending.Mode `
+                -Rate $pending.Rate `
+                -Repetition $pending.Repetition `
+                -CounterBefore $pending.CounterBefore
+            # A returned result means the full configured drain window was checked.
+            # A timeout remains a failure; do not silently repeat another 300 seconds.
+            $script:PendingDrain = $null
+        }
+        catch {
+            $cleanupError = if ($cleanupError) {
+                "$cleanupError；排空检查失败：$($_.Exception.Message)"
+            } else {
+                "排空检查失败：$($_.Exception.Message)"
+            }
+            # The drain routine itself could not complete (for example, required
+            # telemetry disappeared). Record the failure and avoid an infinite
+            # series of identical retries during final packaging.
+            $script:PendingDrain = $null
+        }
+    }
+
+    $cleanupRecord = [pscustomobject]@{
+        timestamp_utc = [DateTime]::UtcNow.ToString("o")
+        reason = $Reason
+        process_stopped = $processStopped
+        drain_attempted = ($null -ne $drain)
+        drain_success = if ($null -ne $drain) { $drain.success } else { $false }
+        drain_reason = if ($null -ne $drain) { $drain.reason } else { $null }
+        drain_seconds = if ($null -ne $drain) { $drain.seconds } else { $null }
+        error = $cleanupError
+    }
+
+    try {
+        if ($pending.RunDir -and (Test-Path $pending.RunDir)) {
+            $cleanupRecord | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $pending.RunDir "emergency-cleanup.json") -Encoding UTF8
+        }
+    }
+    catch {
+        Write-Warning "无法保存 emergency-cleanup.json：$($_.Exception.Message)"
+    }
+
+    if ($cleanupError) { Write-Warning $cleanupError }
+    if ($null -ne $drain -and -not $drain.success) {
+        Write-Warning "异常清理期间未能确认消息排空：$($drain.reason)"
+    }
+    return $cleanupRecord
+}
+
 function Scrub-K6Log {
     param([string]$Path, [object[]]$Credentials)
     if (-not (Test-Path $Path)) { return }
@@ -841,9 +955,11 @@ function Scrub-K6Log {
 # ------------------------------
 # Main validation and preparation
 # ------------------------------
+try {
 if (-not (Test-Path $ProjectPath)) { throw "找不到项目目录：$ProjectPath" }
 $script:ProjectPath = (Resolve-Path $ProjectPath).Path
-Set-Location $script:ProjectPath
+Push-Location -LiteralPath $script:ProjectPath
+$script:LocationPushed = $true
 $script:BaseUrl = $BaseUrl
 $script:DrainTimeoutSeconds = $DrainTimeoutSeconds
 $script:DrainStableSamples = $DrainStableSamples
@@ -856,9 +972,22 @@ $script:LastDockerSampleUtc = $null
 
 if ($Repetitions -lt 1) { throw "Repetitions 必须大于等于 1。" }
 if ($SampleIntervalSeconds -lt 1) { throw "SampleIntervalSeconds 不能小于 1。" }
-if ($Rates.Count -lt 1 -or @($Rates | Where-Object { $_ -le 0 }).Count -gt 0) { throw "Rates 必须全部为正整数。" }
+if ($DockerSampleIntervalSeconds -lt 1) { throw "DockerSampleIntervalSeconds 必须大于等于 1。" }
+if ($BaselineSeconds -lt 0) { throw "BaselineSeconds 不能小于 0。" }
+if ($DrainTimeoutSeconds -lt 1) { throw "DrainTimeoutSeconds 必须大于等于 1。" }
+if ($DrainStableSamples -lt 1) { throw "DrainStableSamples 必须大于等于 1。" }
+if ($DrainPollSeconds -lt 1) { throw "DrainPollSeconds 必须大于等于 1。" }
+if ($CooldownSeconds -lt 0) { throw "CooldownSeconds 不能小于 0。" }
+if ($JavaPid -lt 0) { throw "JavaPid 不能小于 0。" }
+if (@($Rates).Count -lt 1 -or @($Rates | Where-Object { $_ -le 0 }).Count -gt 0) { throw "Rates 必须全部为正整数。" }
+if (@($Rates | Select-Object -Unique).Count -ne @($Rates).Count) { throw "Rates 不应包含重复速率。" }
 if ($MaxVus -lt $PreVus -or $PreVus -le 0) { throw "请确保 PreVus > 0 且 MaxVus >= PreVus。" }
 if ($TargetType -notin @("POST", "PICTURE")) { throw "TargetType 只能是 POST 或 PICTURE。" }
+if ([string]::IsNullOrWhiteSpace($SessionCookieName)) { throw "SessionCookieName 不能为空。" }
+if ((ConvertTo-DurationSeconds -Duration $Duration) -le 0) { throw "Duration 格式无效，请使用例如 60s、2m 或 1m30s。" }
+if ([string]::IsNullOrWhiteSpace($SetupTimeout) -or [string]::IsNullOrWhiteSpace($RequestTimeout)) {
+    throw "SetupTimeout 和 RequestTimeout 不能为空。"
+}
 
 $scriptFile = Join-Path $script:ProjectPath $K6Script
 if (-not (Test-Path $scriptFile)) { throw "找不到 k6 脚本：$scriptFile。请先把压测包中的 k6\community_like_mq_benchmark.js 复制到项目的 k6 目录，或用 -K6Script 指定已有脚本。" }
@@ -881,8 +1010,55 @@ try {
     $targetData = Get-Content -Raw -Path $targetsPath | ConvertFrom-Json
 }
 catch { throw "测试账号或目标 JSON 格式错误：$($_.Exception.Message)" }
-if (@($credentialData).Count -lt $MaxVus) { throw "测试账号数 $(@($credentialData).Count) 小于 MaxVus=$MaxVus；当前 k6 脚本要求账号数至少等于 MAX_VUS。" }
-if (-not $targetData.hotTargetId -or @($targetData.targetIds).Count -lt 2) { throw "targets.local.json 必须提供 hotTargetId 和至少两个 targetIds。" }
+$credentialItems = @($credentialData)
+if ($credentialItems.Count -lt $MaxVus) {
+    throw "测试账号数 $($credentialItems.Count) 小于 MaxVus=$MaxVus；当前 k6 脚本要求账号数至少等于 MAX_VUS。"
+}
+$seenAccounts = @{}
+foreach ($credential in $credentialItems) {
+    $accountValue = Get-ObjectPropertyValue -Object $credential -Name "userAccount" -Default $null
+    $passwordValue = Get-ObjectPropertyValue -Object $credential -Name "userPassword" -Default $null
+    if ($accountValue -isnot [string] -or [string]::IsNullOrWhiteSpace($accountValue)) {
+        throw "测试账号 JSON 中的 userAccount 必须是非空字符串。"
+    }
+    if ($passwordValue -isnot [string] -or [string]::IsNullOrWhiteSpace($passwordValue)) {
+        throw "测试账号 $accountValue 的 userPassword 必须是非空字符串。"
+    }
+    if ($accountValue -ne $accountValue.Trim()) {
+        throw "测试账号 userAccount 不应包含首尾空格：$accountValue。"
+    }
+    $accountKey = $accountValue.Trim()
+    if ($seenAccounts.ContainsKey($accountKey)) { throw "测试账号文件中存在重复 userAccount：$accountKey。每个 VU 必须使用独立账号。" }
+    $seenAccounts[$accountKey] = $true
+}
+
+$configuredHotTargetIdValue = Get-ObjectPropertyValue -Object $targetData -Name "hotTargetId" -Default $null
+$configuredTargetIds = Get-ObjectPropertyValue -Object $targetData -Name "targetIds" -Default @()
+$environmentHotTargetId = [Environment]::GetEnvironmentVariable("TARGET_ID", "Process")
+if (-not [string]::IsNullOrWhiteSpace($environmentHotTargetId)) {
+    $hotTargetCandidate = $environmentHotTargetId
+}
+else {
+    if ($configuredHotTargetIdValue -isnot [string]) {
+        throw "targets.local.json 的 hotTargetId 必须使用字符串保存，避免 64 位 ID 被 JavaScript Number 精度截断。"
+    }
+    $hotTargetCandidate = $configuredHotTargetIdValue
+}
+if ($hotTargetCandidate -notmatch '^\d+$') { throw "targets.local.json 必须提供有效的数字 hotTargetId，或通过 TARGET_ID 指定。" }
+if (@($configuredTargetIds).Count -lt 1) { throw "targets.local.json 的 targetIds 至少需要提供一个目标 ID。" }
+$targetIdCandidates = @($hotTargetCandidate)
+foreach ($candidate in @($configuredTargetIds)) {
+    if ($candidate -isnot [string]) {
+        throw "targetIds 中的 ID 必须用 JSON 字符串保存，避免 64 位 ID 被 JavaScript Number 精度截断。"
+    }
+    $candidateText = $candidate
+    if ($candidateText -notmatch '^\d+$') { throw "targetIds 中存在无效数字 ID：$candidateText。" }
+    $targetIdCandidates += $candidateText
+}
+$uniqueTargetIds = @($targetIdCandidates | Select-Object -Unique)
+if ($uniqueTargetIds.Count -lt 2) {
+    throw "single/multi/mixed 实验矩阵至少需要 hotTargetId 之外的一个不同目标 ID。"
+}
 
 $env:BASE_URL = $BaseUrl
 $env:TARGET_TYPE = $TargetType
@@ -895,7 +1071,7 @@ $env:SETUP_TIMEOUT = $SetupTimeout
 $env:REQUEST_TIMEOUT = $RequestTimeout
 $env:K6_NO_COLOR = "1"
 
-$timestampName = Get-Date -Format "yyyyMMdd-HHmmss"
+$timestampName = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $outputRootPath = if ([IO.Path]::IsPathRooted($OutputRoot)) { $OutputRoot } else { Join-Path $script:ProjectPath $OutputRoot }
 New-Item -ItemType Directory -Force -Path $outputRootPath | Out-Null
 $script:SessionDir = Join-Path $outputRootPath "community-like-benchmark-$timestampName"
@@ -903,8 +1079,8 @@ New-Item -ItemType Directory -Force -Path $script:SessionDir | Out-Null
 $script:ResolvedAppLogPath = $null
 if (-not [string]::IsNullOrWhiteSpace($AppLogPath)) {
     $script:ResolvedAppLogPath = if ([IO.Path]::IsPathRooted($AppLogPath)) { $AppLogPath } else { Join-Path $script:ProjectPath $AppLogPath }
-    if (-not (Test-Path $script:ResolvedAppLogPath)) {
-        Write-Warning "指定的 AppLogPath 当前不存在：$script:ResolvedAppLogPath；将不复制应用日志。"
+    if (-not (Test-Path -LiteralPath $script:ResolvedAppLogPath -PathType Leaf)) {
+        Write-Warning "指定的 AppLogPath 不是现存文件：$script:ResolvedAppLogPath；将不复制应用日志。"
         $script:ResolvedAppLogPath = $null
     }
 }
@@ -959,6 +1135,7 @@ $manifest = [pscustomobject]@{
     target_type = $TargetType
     session_cookie_name = $SessionCookieName
     duration = $Duration
+    summary_trend_stats = @("avg", "min", "med", "max", "p(90)", "p(95)", "p(99)")
     pre_vus = $PreVus
     max_vus = $MaxVus
     rates = $Rates
@@ -1059,7 +1236,7 @@ try {
             $summaryPath = Join-Path $runDir "k6-summary.json"
             $stdoutPath = Join-Path $runDir "k6-stdout.log"
             $stderrPath = Join-Path $runDir "k6-stderr.log"
-            $k6Args = @("run", $scriptFile, "--summary-export", $summaryPath)
+            $k6Args = @("run", $scriptFile, "--summary-export", $summaryPath, "--summary-trend-stats=avg,min,med,max,p(90),p(95),p(99)")
             $argumentLine = (($k6Args | ForEach-Object { Get-QuotedArgument ([string]$_) }) -join " ")
             $startTime = Get-Date
             $startUtc = [DateTime]::UtcNow
@@ -1092,9 +1269,50 @@ try {
                 throw "本轮开始前异步链路并非空闲：$($initialBacklog -join ', ')。请先排空/审计历史消息，再开始实验。"
             }
 
+            $processId = 0
+            $process = $null
+            $affinityApplied = $false
+            $loadMarkerSeen = $false
+            $loadStartedAt = $null
+            $exitCode = $null
+            $exitCodeReadError = $null
+            $runProcessingError = $null
+            $postloadCaptureError = $null
+            $summaryError = $null
+            $exitCodeInferred = $false
+            $afterLoadMap = $null
+
+            $k6Summary = [pscustomobject]@{
+                actual_rps = $null
+                actual_rps_metric = "unavailable: summary missing or invalid"
+                like_http_requests = $null
+                like_http_requests_metric = "unavailable"
+                http_req_duration_avg_ms = $null
+                http_req_duration_p95_ms = $null
+                http_req_duration_percentile_source = $null
+                http_req_duration_p99_ms = $null
+                http_req_duration_max_ms = $null
+                http_req_failed_rate = $null
+                business_failure_rate = $null
+                business_failure_count = $null
+                iterations = $null
+                dropped_iterations = $null
+                summary = $null
+            }
+
             $process = Start-Process -FilePath $script:K6Exe -ArgumentList $argumentLine -WorkingDirectory $script:ProjectPath `
                 -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-            $affinityApplied = $false
+            $script:ActiveK6Process = $process
+            $script:PendingDrain = [pscustomobject]@{
+                RunId = $runId
+                RunDir = $runDir
+                Mode = $mode
+                Rate = $rate
+                Repetition = $rep
+                CounterBefore = $beforeMap
+            }
+            $processId = $process.Id
+
             if (-not $script:SkipCpuAffinity) {
                 try {
                     $process.ProcessorAffinity = [IntPtr]$affinityMask
@@ -1102,33 +1320,77 @@ try {
                 }
                 catch { Write-Warning "k6 已启动，但 CPU 绑核失败：$($_.Exception.Message)" }
             }
-            $processId = $process.Id
-            $loadMarkerSeen = $false
-            $loadStartedAt = $null
+
             $lastMarkerScan = [DateTime]::MinValue
-            while ($true) {
-                $process.Refresh()
-                $now = Get-Date
-                if (-not $loadMarkerSeen -and (($now - $lastMarkerScan).TotalSeconds -ge 1)) {
-                    $lastMarkerScan = $now
-                    # k6 console.log is written to stderr in this environment,
-                    # so check both redirected files rather than stdout only.
-                    if (Test-LoadMarkerInLogs -Paths @($stdoutPath, $stderrPath)) {
-                        $loadMarkerSeen = $true
-                        $loadStartedAt = $now
-                        Write-Host "检测到 k6 正式负载开始标记，后续 Prometheus/主机采样归入 load 阶段。" -ForegroundColor Cyan
+            try {
+                while ($true) {
+                    $process.Refresh()
+                    $now = Get-Date
+                    if (-not $loadMarkerSeen -and (($now - $lastMarkerScan).TotalSeconds -ge 1)) {
+                        $lastMarkerScan = $now
+                        # k6 console.log is written to stderr in some environments;
+                        # inspect both redirected streams.
+                        if (Test-LoadMarkerInLogs -Paths @($stdoutPath, $stderrPath)) {
+                            $loadMarkerSeen = $true
+                            $loadStartedAt = $now
+                            Write-Host "检测到 k6 正式负载开始标记，后续 Prometheus/主机采样归入 load 阶段。" -ForegroundColor Cyan
+                        }
+                    }
+                    if ($process.HasExited) { break }
+                    $samplePhase = if ($loadMarkerSeen) { "load" } else { "setup" }
+                    Capture-TelemetrySample -Phase $samplePhase -RunId $runId -Mode $mode -Rate $rate -Repetition $rep -K6ProcessId $processId | Out-Null
+                    Start-Sleep -Seconds $SampleIntervalSeconds
+                }
+            }
+            catch {
+                $runProcessingError = $_.Exception.Message
+                Write-Warning "压测监控过程发生异常，将终止 k6 并优先排空已产生的消息：$runProcessingError"
+                try {
+                    $process.Refresh()
+                    if (-not $process.HasExited) {
+                        Stop-Process -Id $processId -Force -ErrorAction Stop
                     }
                 }
-                if ($process.HasExited) { break }
-                $samplePhase = if ($loadMarkerSeen) { "load" } else { "setup" }
-                Capture-TelemetrySample -Phase $samplePhase -RunId $runId -Mode $mode -Rate $rate -Repetition $rep -K6ProcessId $processId | Out-Null
-                Start-Sleep -Seconds $SampleIntervalSeconds
+                catch {
+                    Write-Warning "尝试停止异常运行的 k6 进程失败：$($_.Exception.Message)"
+                }
             }
-            $process.WaitForExit()
-            $process.Refresh()
-            $exitCode = $null
-            try { $exitCode = $process.ExitCode } catch { }
-            $process.Dispose()
+
+            $processExitConfirmed = $false
+            try {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                    # Monitoring can fail while k6 is still running. Give the
+                    # forced stop a bounded window rather than waiting forever.
+                    if (-not $process.WaitForExit(30000)) {
+                        Stop-Process -Id $processId -Force -ErrorAction Stop
+                        if (-not $process.WaitForExit(30000)) {
+                            throw "停止 k6 后仍未退出，PID=$processId。"
+                        }
+                    }
+                }
+                $process.WaitForExit()
+                $process.Refresh()
+                $processExitConfirmed = $process.HasExited
+                if (-not $processExitConfirmed) {
+                    throw "无法确认 k6 进程已经退出，PID=$processId。"
+                }
+                $exitCode = [int]$process.ExitCode
+            }
+            catch {
+                $exitCodeReadError = $_.Exception.Message
+                Write-Warning "读取/等待 k6 进程退出状态失败：$exitCodeReadError"
+            }
+            finally {
+                if ($processExitConfirmed) {
+                    try { $process.Dispose() } catch { }
+                    $script:ActiveK6Process = $null
+                }
+            }
+            if (-not $processExitConfirmed) {
+                throw "不能确认 k6 进程已停止；停止后端消息生产后才能排空，交由异常清理逻辑重试。PID=$processId"
+            }
+
             if (-not $loadMarkerSeen -and (Test-LoadMarkerInLogs -Paths @($stdoutPath, $stderrPath))) {
                 $loadMarkerSeen = $true
                 $loadStartedAt = Get-Date
@@ -1138,56 +1400,102 @@ try {
             $elapsedSeconds = [math]::Round(($endTime - $startTime).TotalSeconds, 2)
             $setupSeconds = if ($loadStartedAt) { [math]::Round(($loadStartedAt - $startTime).TotalSeconds, 2) } else { $null }
 
-            $afterLoadMap = Write-PrometheusSample -Phase "postload" -RunId $runId -Mode $mode -Rate $rate -Repetition $rep
-            if (-not (Test-Path $summaryPath)) {
-                throw "k6 没有生成 summary 文件，退出码=$exitCode；查看 $stdoutPath 与 $stderrPath。"
-            }
-            $k6Summary = Get-K6SummaryFields -SummaryPath $summaryPath -LoadDuration $Duration
-
-            # p(99) is printed in the k6 threshold summary but is not included
-            # in this summary-export JSON by the default trend stats.
             try {
-                $k6StdoutText = Get-Content -Raw -Path $stdoutPath
-                if ($k6StdoutText -match 'p\(99\)=([0-9]+(?:\.[0-9]+)?)ms') {
-                    $k6Summary.http_req_duration_p99_ms = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+                $afterLoadMap = Write-PrometheusSample -Phase "postload" -RunId $runId -Mode $mode -Rate $rate -Repetition $rep
+            }
+            catch {
+                $postloadCaptureError = $_.Exception.Message
+                Write-Warning "压测后 Prometheus 快照采集失败：$postloadCaptureError"
+            }
+
+            # Summary failure must not bypass the mandatory RabbitMQ/Redis drain.
+            try {
+                if (-not (Test-Path $summaryPath)) {
+                    throw "k6 没有生成 summary 文件，退出码=$exitCode；请查看 $stdoutPath 与 $stderrPath。"
+                }
+                $k6Summary = Get-K6SummaryFields -SummaryPath $summaryPath -LoadDuration $Duration
+
+                # Remove setup_data immediately: it contains satoken cookies from k6 setup().
+                # If sanitization cannot be persisted, delete the raw summary rather than
+                # allowing credentials to enter the result ZIP.
+                if ($null -ne $k6Summary.summary -and $k6Summary.summary.PSObject.Properties["setup_data"]) {
+                    $k6Summary.summary.PSObject.Properties.Remove("setup_data")
+                    try {
+                        $k6Summary.summary | ConvertTo-Json -Depth 30 | Set-Content -Path $summaryPath -Encoding UTF8
+                    }
+                    catch {
+                        Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+                        throw "summary 含 setup_data，脱敏写回失败，已删除原始 summary 文件以保护会话 Cookie：$($_.Exception.Message)"
+                    }
+                }
+
+                if ($null -eq $k6Summary.http_req_duration_p99_ms) {
+                    throw "summary 中缺少 p(99)。请确认 k6 支持 --summary-trend-stats 且本次命令已生效。"
+                }
+                if ($null -eq $k6Summary.iterations -or $null -eq $k6Summary.http_req_duration_p95_ms -or
+                    $null -eq $k6Summary.http_req_failed_rate -or $null -eq $k6Summary.business_failure_rate -or
+                    $null -eq $k6Summary.dropped_iterations) {
+                    throw "summary 缺少计算基准结果所需的关键指标（iterations/p95/failure-rate/dropped-iterations）。"
                 }
             }
-            catch { }
-
-            # Do not archive setup_data: it contains the satoken cookies returned
-            # by k6 setup() for all test users.
-            if ($k6Summary.summary.PSObject.Properties["setup_data"]) {
-                $k6Summary.summary.PSObject.Properties.Remove("setup_data")
-                $k6Summary.summary | ConvertTo-Json -Depth 30 | Set-Content -Path $summaryPath -Encoding UTF8
+            catch {
+                $summaryError = $_.Exception.Message
+                Write-Warning "k6 summary 无法作为有效结果使用；仍将先执行消息排空：$summaryError"
             }
 
             # If Start-Process did not expose ExitCode, infer only from a complete
-            # k6 TOTAL RESULTS output plus all configured benchmark thresholds.
-            $exitCodeInferred = $false
+            # k6 TOTAL RESULTS section plus all threshold inputs in the summary.
             if ($null -eq $exitCode) {
-                $fallbackExitCode = Get-K6FallbackExitCode -SummaryPath $summaryPath -StdoutPath $stdoutPath
+                $fallbackExitCode = Get-K6FallbackExitCode `
+                    -SummaryPath $summaryPath `
+                    -StdoutPath $stdoutPath `
+                    -StderrPath $stderrPath
+
                 if ($null -eq $fallbackExitCode) {
-                    throw "无法读取 k6 进程退出码，且无法从完整 summary/阈值输出确认结果；请检查 $stdoutPath 与 $stderrPath。"
+                    Write-Warning "无法确认 k6 退出状态，先执行异步消息排空并保存本轮数据。"
                 }
-                $exitCode = [int]$fallbackExitCode
-                $exitCodeInferred = $true
-                Write-Warning "PowerShell 未返回 k6 原生退出码；已根据完整 summary 和基准阈值推断退出状态=$exitCode。该状态会在 run-metadata 中标记为 inferred。"
+                else {
+                    $exitCode = [int]$fallbackExitCode
+                    $exitCodeInferred = $true
+                }
             }
 
-            $k6Summary.summary.metrics.PSObject.Properties | ForEach-Object {
-                Write-CsvRow -Path $metricIndexPath -Row ([pscustomobject]@{
-                    run_id = $runId
-                    repetition = $rep
-                    mode = $mode
-                    target_rps = $rate
-                    metric_name = $_.Name
-                    metric_type = (Get-ObjectPropertyValue -Object $_.Value -Name "type")
-                    metric_values_json = ($_.Value | ConvertTo-Json -Depth 10 -Compress)
-                })
+            # Export all available k6 metrics. This is optional telemetry and must
+            # never prevent the mandatory message drain if the summary is partial.
+            if ($null -ne $k6Summary.summary) {
+                $summaryMetrics = Get-ObjectPropertyValue -Object $k6Summary.summary -Name "metrics"
+                if ($null -ne $summaryMetrics) {
+                    foreach ($metricProperty in $summaryMetrics.PSObject.Properties) {
+                        Write-CsvRow -Path $metricIndexPath -Row ([pscustomobject]@{
+                            run_id = $runId
+                            repetition = $rep
+                            mode = $mode
+                            target_rps = $rate
+                            metric_name = $metricProperty.Name
+                            metric_type = (Get-ObjectPropertyValue -Object $metricProperty.Value -Name "type")
+                            metric_values_json = ($metricProperty.Value | ConvertTo-Json -Depth 10 -Compress)
+                        })
+                    }
+                }
             }
 
-            # Wait until asynchronous RabbitMQ/Redis work has actually drained before the next run.
-            $drain = Wait-MqBacklogDrain -RunId $runId -Mode $mode -Rate $rate -Repetition $rep -CounterBefore $beforeMap
+            # This is the critical cleanup point: only after k6 has stopped do we
+            # wait for Redis Stream, RabbitMQ main/retry/DLQ and audit persistence.
+            $drainError = $null
+            try {
+                $drain = Wait-MqBacklogDrain -RunId $runId -Mode $mode -Rate $rate -Repetition $rep -CounterBefore $beforeMap
+                $script:PendingDrain = $null
+            }
+            catch {
+                $drainError = $_.Exception.Message
+                Write-Warning "本轮排空过程异常：$drainError；最终清理阶段将再尝试一次。"
+                $drain = [pscustomobject]@{
+                    success = $false
+                    reason = "drain_exception"
+                    seconds = $null
+                    after_metrics = $null
+                }
+            }
             $afterDrainMap = $drain.after_metrics
             $drainEndUtc = [DateTime]::UtcNow
 
@@ -1205,9 +1513,9 @@ try {
                 $deadLetterAuditPendingDelta = [math]::Max(0.0, ([double]$deadLetterPublishedDelta - [double]$deadLetterAuditPersistedDelta))
             }
 
-            # Scrub any test-account names that might have appeared in error logs.
-            Scrub-K6Log -Path $stdoutPath -Credentials @($credentialData)
-            Scrub-K6Log -Path $stderrPath -Credentials @($credentialData)
+            # Scrub test-account names from k6 logs before packaging.
+            Scrub-K6Log -Path $stdoutPath -Credentials $credentialItems
+            Scrub-K6Log -Path $stderrPath -Credentials $credentialItems
 
             $summaryObject = [pscustomobject]@{
                 run_id = $runId
@@ -1231,6 +1539,11 @@ try {
                 elapsed_seconds_including_setup = $elapsedSeconds
                 setup_seconds_until_first_iteration = $setupSeconds
                 load_marker_seen = $loadMarkerSeen
+                monitoring_error = $runProcessingError
+                postload_capture_error = $postloadCaptureError
+                summary_error = $summaryError
+                exit_code_read_error = $exitCodeReadError
+                drain_error = $drainError
                 k6_exit_code = $exitCode
                 k6_exit_code_inferred = $exitCodeInferred
                 k6_thresholds_failed = ($exitCode -eq 99)
@@ -1262,9 +1575,9 @@ try {
                 dead_letter_audit_persisted_delta = $deadLetterAuditPersistedDelta
                 dead_letter_audit_failures_delta = $deadLetterAuditFailuresDelta
                 dead_letter_audit_pending_delta = $deadLetterAuditPendingDelta
-                dead_letter_detected = ($deadLetterPublishedDelta -gt 0)
-                dead_letter_audit_complete = ($deadLetterAuditPendingDelta -eq 0)
-                dead_letter_clean_run = ($deadLetterPublishedDelta -eq 0 -and $deadLetterAuditFailuresDelta -eq 0)
+                dead_letter_detected = if ($null -ne $deadLetterPublishedDelta) { $deadLetterPublishedDelta -gt 0 } else { $null }
+                dead_letter_audit_complete = if ($null -ne $deadLetterAuditPendingDelta) { $deadLetterAuditPendingDelta -eq 0 } else { $null }
+                dead_letter_clean_run = if ($null -ne $deadLetterPublishedDelta -and $null -ne $deadLetterAuditFailuresDelta) { ($deadLetterPublishedDelta -eq 0 -and $deadLetterAuditFailuresDelta -eq 0) } else { $null }
                 rabbitmq_published_delta = Get-CounterDelta -Before $beforeMap -After $afterDrainMap -MetricName "rabbitmq_published_total"
                 rabbitmq_consumed_delta = Get-CounterDelta -Before $beforeMap -After $afterDrainMap -MetricName "rabbitmq_consumed_total"
                 rabbitmq_failed_publish_delta = Get-CounterDelta -Before $beforeMap -After $afterDrainMap -MetricName "rabbitmq_failed_to_publish_total"
@@ -1284,8 +1597,20 @@ try {
             if (-not $drain.success) {
                 throw "本轮结束后消息未可靠排空（$($drain.reason)）。已保存本轮数据，停止后续实验：$runId"
             }
+            if ($runProcessingError) {
+                throw "本轮监控过程异常，结果不纳入有效基线：$runProcessingError"
+            }
+            if ($postloadCaptureError) {
+                throw "本轮 postload 指标采集异常，结果不纳入有效基线：$postloadCaptureError"
+            }
+            if ($summaryError) {
+                throw "本轮 k6 summary 无效，结果不纳入有效基线：$summaryError"
+            }
+            if ($null -eq $exitCode) {
+                throw "k6 退出状态无法确认。本轮已完成排空并保存数据，但不能计入有效性能测试。"
+            }
             if ($exitCode -ne 0 -and $exitCode -ne 99) {
-                throw "k6 返回非阈值失败退出码 $exitCode。已保存本轮数据和排空结果，停止后续实验：$runId"
+                throw "k6 返回异常退出码：$exitCode"
             }
             if ($null -eq $deadLetterPublishedDelta -or $null -eq $deadLetterAuditFailuresDelta) {
                 throw "本轮死信 Counter 快照不可用；该轮结果不能纳入基线，停止后续矩阵：$runId"
@@ -1302,12 +1627,21 @@ try {
 catch {
     $abortReason = $_.Exception.Message
     Write-Warning "矩阵中止：$abortReason"
+    if ($null -ne $script:PendingDrain) {
+        Invoke-PendingDrainCleanup -Reason "matrix_exception" | Out-Null
+    }
+}
+
+# Last chance before packaging: do not let an exception path silently leave a run pending.
+if ($null -ne $script:PendingDrain) {
+    Invoke-PendingDrainCleanup -Reason "before_final_package" | Out-Null
 }
 
 # ------------------------------
 # Final package and README notes
 # ------------------------------
 $finalStatus = if ($abortReason) { "partial_or_aborted" } else { "completed" }
+if ($abortReason) { $script:FinalExitCode = 2 }
 $finalManifestPath = Join-Path $script:SessionDir "completion.json"
 [pscustomobject]@{
     status = $finalStatus
@@ -1337,10 +1671,11 @@ Key files:
 - baseline/: idle host and Actuator Prometheus baseline samples.
 - Rxx-.../: per-run k6 summary/logs, full Prometheus time series, Windows host samples, Docker stats and drain-check records.
 - completion.json: whether all runs completed or the matrix stopped early.
+- emergency-cleanup.json: best-effort stop/drain record when a run exits unexpectedly.
 - application-logs/backend-app.log: optional copy of the Spring Boot log if -AppLogPath was supplied.
 
 Important interpretation rules:
-1. target_rps is the scheduled arrival rate. Use actual_rps and dropped_iterations to judge whether k6 achieved it.
+1. target_rps is the scheduled arrival rate. Use actual_rps and dropped_iterations to judge whether k6 achieved it. P99 is exported explicitly via --summary-trend-stats.
 2. The benchmark k6 copy emits BENCHMARK_LOAD_STARTED on its first actual load iteration. Prometheus/host samples before that marker are phase=setup (the 400 account logins); samples after it are phase=load.
 3. Prefer http_req_duration{name:like_toggle} for API latency. If absent, the index falls back to aggregate http_req_duration and marks the actual-RPS source similarly; this fallback may include setup/login requests.
 4. The k6 API latency is request acceptance latency, not MySQL persistence latency. Use consumer_messages_delta, RabbitMQ queue/Stream gauges, batch duration metrics, and drain time to analyze asynchronous persistence.
@@ -1359,7 +1694,46 @@ Compress-Archive -Path (Join-Path $script:SessionDir "*") -DestinationPath $zipP
 
 if ($abortReason) {
     Write-Warning "已打包部分结果：$zipPath"
-    Write-Warning "矩阵未完整完成：$abortReason"
-    exit 2
 }
-Write-Host "所有压测完成并已打包：$zipPath" -ForegroundColor Green
+else {
+    Write-Host "所有压测完成并已打包：$zipPath" -ForegroundColor Green
+}
+ }
+finally {
+    # 如果矩阵异常处理之外仍遗留运行中的压测，先停止 k6 并尽力排空，再恢复 PowerShell 状态。
+    if ($null -ne $script:PendingDrain) {
+        $script:NeedsRepackageAfterCleanup = $true
+        try { Invoke-PendingDrainCleanup -Reason "script_finally" | Out-Null }
+        catch { Write-Warning "脚本最终清理失败：$($_.Exception.Message)" }
+    }
+
+    foreach ($environmentName in $script:ManagedEnvironmentVariables) {
+        $snapshot = $script:EnvironmentSnapshot[$environmentName]
+        if ($snapshot.Exists) {
+            [Environment]::SetEnvironmentVariable($environmentName, $snapshot.Value, "Process")
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($environmentName, $null, "Process")
+        }
+    }
+
+    if ($script:LocationPushed) {
+        Pop-Location
+        $script:LocationPushed = $false
+    }
+}
+
+if ($script:NeedsRepackageAfterCleanup -and (Test-Path $zipPath) -and (Test-Path $script:SessionDir)) {
+    try {
+        Remove-Item -LiteralPath $zipPath -Force
+        Compress-Archive -Path (Join-Path $script:SessionDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
+        Write-Host "已将最终异常清理记录重新写入压缩包：$zipPath" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Warning "最终压缩包刷新失败，目录中的原始结果仍保留：$($_.Exception.Message)"
+    }
+}
+
+if ($script:FinalExitCode -ne 0) {
+    exit $script:FinalExitCode
+}

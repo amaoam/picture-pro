@@ -22,6 +22,15 @@ const credentials = new SharedArray('mq-load-test-credentials', function () {
 const targetConfig = JSON.parse(open(__ENV.TARGETS_FILE || './targets.local.json'));
 
 export const options = {
+  summaryTrendStats: [
+    'avg',
+    'min',
+    'med',
+    'max',
+    'p(90)',
+    'p(95)',
+    'p(99)',
+  ],
   setupTimeout: __ENV.SETUP_TIMEOUT || '5m',
   scenarios: {
     like_toggle_load: {
