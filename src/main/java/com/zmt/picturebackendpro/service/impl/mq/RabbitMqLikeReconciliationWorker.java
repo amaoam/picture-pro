@@ -50,6 +50,11 @@ import java.util.Set;
  * （{@code community_like_event_consume}）的最大已消费版本兜底，再由现存 pair-state 的
  * GREATEST 保留更高水位，避免重放旧死信覆盖当前状态。
  * <p>
+ * 并发防线（与消费者对齐）：
+ * 消费者在写入关系表之前会先按 {@code (target_type,target_id,actor_user_id)} 固定顺序锁定
+ * pair-state 行；本 worker 在读取/写入关系表之前也执行完全相同的 actor 排序 + 锁顺序
+ * （见 {@link #lockPairStates}），使对账与 Retry Queue 消费不会在对账中途互相覆盖。
+ * <p>
  * 事务：整个对账在一个事务内完成（关系修复 + pair state 同步 + 计数校准 + 经验事件写入），
  * 任一环节异常则整体回滚。注意 Redis count 写入不在 MySQL 事务内，因此顺序上先写 MySQL、
  * 后写 Redis，保证 MySQL 回滚时 Redis 计数尚未被修改。
@@ -82,7 +87,8 @@ public class RabbitMqLikeReconciliationWorker {
      *   <li>读取 Redis 状态，执行"缺失状态保护"判断（见类注释）；</li>
      *   <li>读取 Redis liked-users Set 与 pairVersions Hash；</li>
      *   <li>加载目标元数据（作者 ID、目标是否可用），不可用则跳过；</li>
-     *   <li>对比 Redis 用户集合与 MySQL 关系表：
+     *   <li><b>按固定 actor 顺序锁定本 target 涉及的 pair-state 行</b>，与消费者锁顺序对齐；</li>
+     *   <li>对比 Redis 用户集合与 MySQL 关系表（{@code FOR UPDATE} 加锁读取）：
      *     <ul>
      *       <li>Redis 有、MySQL 无：INSERT IGNORE 补齐，并生成 +1 经验事件；</li>
      *       <li>MySQL 有、Redis 无：DELETE 删除，并生成 -1 经验事件；</li>
@@ -163,11 +169,18 @@ public class RabbitMqLikeReconciliationWorker {
             return 0;
         }
 
+        // 消费者在更新关系前会先锁定同一组 pair-state 行。
+        // 对账也必须按完全一致的 actor 排序和锁顺序执行，否则 Retry 消息可能在对账中途写回。
+        lockPairStates(type, targetId, redisUsers, redisVersions);
+
         // ---------- 4. 对比 Redis 与 MySQL 关系表 ----------
+        // 与消费者对 pair-state 的锁顺序保持一致：ORDER BY userId + FOR UPDATE。
+        // 这样即便有 Retry 消息并发写回同一 target，也会先在对账持有 pair-state 行锁时阻塞，
+        // 不会出现"对账读到旧关系、消费者已写入新关系"的读写交错。
         String relationSql = "POST".equals(type)
                 ? "SELECT userId FROM community_post_like WHERE postId=?"
                 : "SELECT userId FROM picture_like WHERE pictureId=?";
-        List<Long> mysqlRows = jdbcTemplate.query(relationSql,
+        List<Long> mysqlRows = jdbcTemplate.query(relationSql + " ORDER BY userId FOR UPDATE",
                 (rs, rowNum) -> rs.getLong("userId"), targetId);
         Set<Long> mysqlUsers = new HashSet<>(mysqlRows);
         // 本次对账产生的经验值变更事件（新增 +1 / 删除 -1）
@@ -289,6 +302,83 @@ public class RabbitMqLikeReconciliationWorker {
             }
         }
         return versions;
+    }
+
+    /**
+     * 确保本次对账会涉及的每个 actor 都有 pair-state 行，并按 actor_user_id 升序锁定。
+     * <p>
+     * <b>为什么需要这一步：</b>
+     * 消费者（{@code RabbitMqLikePersistenceService}）在写入关系表之前，会先对本批次涉及的
+     * 所有 (target, actor) 按固定顺序对 {@code community_like_pair_state} 行 {@code FOR UPDATE}。
+     * 对账 worker 如果直接读/写关系表而不先锁同一组 pair-state 行，就可能出现：
+     * <ul>
+     *   <li>对账读到 MySQL 关系 "无"，同时消费者正把关系 "有" 写回；</li>
+     *   <li>对账在消费者更新关系之后又按旧快照删除；</li>
+     *   <li>对账更新 pair-state 水位时与消费者 pairVersion 栅栏互相覆盖。</li>
+     * </ul>
+     * 因此对账必须先按完全一致的 actor 排序与锁顺序锁定 pair-state 行，
+     * 让后续的关系读写与 pair-state 同步都在同一把锁保护下进行。
+     * <p>
+     * <b>actor 集合的并集来源：</b>
+     * <ol>
+     *   <li>Redis liked Set（当前真实点赞用户）；</li>
+     *   <li>Redis versions Hash（有版本水位但已取消的用户）；</li>
+     *   <li>MySQL 关系表当前存在的用户（可能将被对账删除）；</li>
+     *   <li>既有 pair-state 中已登记的用户（历史执行过的 actor）。</li>
+     * </ol>
+     * 取并集才能保证"本次对账可能读写到的所有 actor"都被锁住，不会漏锁。
+     * <p>
+     * <b>为什么先 INSERT IGNORE 再 SELECT FOR UPDATE：</b>
+     * pair-state 行可能尚不存在（例如历史回填的用户没有 pair-state），
+     * 先用 {@code INSERT IGNORE} 保证行存在，再 {@code SELECT ... FOR UPDATE} 拿排他锁；
+     * 唯一键 (target_type,target_id,actor_user_id) 保证并发 insert 最多一条生效。
+     * <p>
+     * <b>为什么按 actor_user_id 升序：</b>
+     * 与消费者按 {@code PairKey} 的字典序加锁保持一致（消费者内部先按 targetType、再按
+     * targetId、最后按 actorUserId 排序）。固定顺序是避免多事务死锁的经典手段。
+     *
+     * @param type          目标类型（POST / PICTURE）
+     * @param targetId      目标 ID
+     * @param redisUsers    Redis 当前点赞用户集合
+     * @param redisVersions Redis pairVersion 水位
+     */
+    private void lockPairStates(String type, long targetId,
+                                Set<Long> redisUsers, Map<Long, Long> redisVersions) {
+        // 1. 汇总本次对账可能读写的全部 actor：Redis Set ∪ Redis versions ∪ MySQL 关系 ∪ 既有 pair-state。
+        Set<Long> actorIds = new HashSet<>(redisUsers);
+        actorIds.addAll(redisVersions.keySet());
+
+        String relationSql = "POST".equals(type)
+                ? "SELECT userId FROM community_post_like WHERE postId=?"
+                : "SELECT userId FROM picture_like WHERE pictureId=?";
+        actorIds.addAll(jdbcTemplate.query(relationSql,
+                (rs, rowNum) -> rs.getLong("userId"), targetId));
+
+        actorIds.addAll(jdbcTemplate.query(
+                "SELECT actor_user_id FROM community_like_pair_state WHERE target_type=? AND target_id=?",
+                (rs, rowNum) -> rs.getLong("actor_user_id"), type, targetId));
+
+        // 2. 固定顺序：升序。与消费者的 PairKey 字典序加锁保持一致，避免死锁。
+        List<Long> sortedActorIds = new ArrayList<>(actorIds);
+        Collections.sort(sortedActorIds);
+
+        // 3. 保证每一行存在（INSERT IGNORE 幂等，已存在则无影响）。
+        //    唯一键 (target_type,target_id,actor_user_id) 让并发 insert 最多一条生效。
+        for (Long actorId : sortedActorIds) {
+            jdbcTemplate.update(
+                    "INSERT IGNORE INTO community_like_pair_state " +
+                            "(target_type,target_id,actor_user_id,last_pair_version,liked,updated_at) " +
+                            "VALUES (?,?,?,0,0,CURRENT_TIMESTAMP(3))",
+                    type, targetId, actorId);
+        }
+
+        // 4. 当前读 + 固定排序：确保锁住该 target 当前已登记的全部 pair。
+        //    用 SELECT ... FOR UPDATE 而非 SELECT：对已存在的 pair-state 行加排他锁，
+        //    与消费者的 FOR UPDATE 形成互斥；排序则进一步降低死锁概率。
+        jdbcTemplate.query(
+                "SELECT actor_user_id FROM community_like_pair_state " +
+                        "WHERE target_type=? AND target_id=? ORDER BY actor_user_id FOR UPDATE",
+                (rs, rowNum) -> rs.getLong("actor_user_id"), type, targetId);
     }
 
     /**

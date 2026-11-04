@@ -175,3 +175,6 @@ management:
         "http.server.requests": true
         "community.like.outbox.batch.duration": true
         "community.like.outbox.poll.duration": true
+logging:
+  file:
+    name: ${user.dir}/logs/picture-backend-pro.log

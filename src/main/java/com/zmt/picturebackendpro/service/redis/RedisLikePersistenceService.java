@@ -29,25 +29,38 @@ import com.baomidou.mybatisplus.core.toolkit.IdWorker;
  * 核心设计：
  * 1. 一个 Stream 批次仅使用一个 MySQL 事务（事件流水账、关系表变更、计数聚合、经验副作用处于同一事务）。
  * 2. 严格遵循“事务未提交时绝不进行 Redis XACK”的原则，确保异常时能够整体回滚、消息保持 Pending 状态安全重试。
+ *
+ * 扩展点：
+ * - {@link #beforeApplyEvents(List)}：批次应用关系状态前的钩子，RabbitMQ 子类在此对 pair-state 行加锁并恢复版本上下文。
+ * - {@link #applyRelationStateDeltas(RedisLikeEvent)}：单条事件的关系状态应用钩子，默认严格语义；RabbitMQ 子类覆盖以执行 pairVersion 栅栏。
  */
 @Slf4j
 @Service
 @ConditionalOnProperty(name = "community.like.mode", havingValue = "redis-stream")
 public class RedisLikePersistenceService {
 
+    /**
+     * 由 protected 开放给子类：RabbitMQ 子类需要直接使用 JdbcTemplate 操作 pair-state 与关系表。
+     * 注意保持 @Resource 注入语义不变。
+     */
     @Resource
-    private JdbcTemplate jdbcTemplate;
+    protected JdbcTemplate jdbcTemplate;
 
+    /**
+     * 由 protected 开放给子类：便于子类在同一事务内触发经验副作用（如需要）。
+     */
     @Resource
-    private CommunityExperienceService experienceService;
+    protected CommunityExperienceService experienceService;
 
     /**
      * 将一个 Stream 批次事件持久化到 MySQL。
      * 核心步骤：
      * 1. 批次格式校验 & 组内重复校验。
      * 2. 查询并过滤 MySQL 中已经处理过的 eventId（幂等防重）。
-     * 3. 在当前事务内预登记事件到 Ledger（流水账表）。
-     * 4. 按 Stream ID 原顺序应用关系变更（点赞/取消点赞），收集计数差值（Delta）。
+     * 3. 按 Stream ID 原顺序应用关系变更（点赞/取消点赞），收集计数差值（Delta）。
+     *    RabbitMQ 子类会在这里执行 pairVersion 栅栏，并通过 {@link #applyRelationStateDeltas} 返回真实跃迁。
+     * 4. 在当前事务内登记事件到 Ledger（流水账表）。关系状态应用成功后才写 Ledger，
+     *    但仍在同一事务内；任一步失败都会整体回滚，Rabbit listener 不会 ACK 该批消息。
      * 5. 批量合并更新目标实体的冗余计数（CASE WHEN 优化），防止计数负数。
      * 6. 触发经验服务副作用（积分/经验奖励）。
      *
@@ -79,29 +92,35 @@ public class RedisLikePersistenceService {
             return; // 常见于 MySQL 已提交、但在发送 Redis XACK 前进程崩溃后的安全重投。
         }
 
-        // 第二步：在当前事务内预登记事件。后续任意步骤失败都会一起回滚这些 ledger（流水）记录。
-        insertEventLedger(freshEvents);
-
-        // 第三步：按 Stream ID 的原顺序应用关系状态，只有真实的关系变化才进入计数/经验更新。
+        // 第二步：先应用关系状态。RabbitMQ 子类会在这里执行 pairVersion 栅栏；
+        // Ledger 在关系状态成功处理后再插入，但仍与关系、计数和经验处于同一个事务。
         Map<TargetKey, Long> counterDeltas = new LinkedHashMap<>();
         List<CommunityLikeOutboxEvent> actualTransitions = new ArrayList<>();
 
+        // 扩展点：让子类在应用事件前做必要准备（如按固定顺序加锁 pair-state）。
+        // Redis Stream 模式下为空实现，行为与原逻辑一致。
+        beforeApplyEvents(freshEvents);
+
         for (RedisLikeEvent event : freshEvents) {
-            int changedRows = applyRelationState(event);
-            if (changedRows == 1) {
-                // 关系发生真实变更，统计该目标的计数差值 (Delta)
+            // 扩展点：由子类决定本条事件对关系表的实际跃迁。
+            // Redis Stream 模式沿用原严格语义（changedRows 必须为 1，否则回滚）；
+            // RabbitMQ 子类覆盖此方法执行 pairVersion 栅栏，返回可能为空或包含修复 delta 的列表。
+            List<Integer> actualDeltas = applyRelationStateDeltas(event);
+            if (actualDeltas == null) {
+                throw new IllegalStateException("点赞持久化扩展点返回 null delta 列表: " + event.getEventId());
+            }
+            for (Integer actualDelta : actualDeltas) {
+                if (actualDelta == null || actualDelta == 0) continue;
+                // 只累计实际关系跃迁，不使用事件携带的 delta 推断数据库变化。
                 TargetKey targetKey = new TargetKey(event.getTargetType(), event.targetIdAsLong());
-                counterDeltas.merge(targetKey, (long) event.deltaAsInt(), Long::sum);
-                actualTransitions.add(toExperienceEvent(event));
-            } else {
-                // Redis 与 MySQL 状态不一致时不能盲目 ACK，否则会把漏计数永久固化。
-                // 抛出异常让整个事务回滚，事件保持 pending 状态，等待人工/运维对账修复。
-                throw new IllegalStateException("Redis/MySQL like projection mismatch: eventId=" + event.getEventId()
-                        + ", type=" + event.getTargetType() + ", targetId=" + event.getTargetId()
-                        + ", desiredState=" + event.getDesiredState() + ", userId=" + event.getUserId()
-                        + ", changedRows=" + changedRows);
+                counterDeltas.merge(targetKey, actualDelta.longValue(), Long::sum);
+                actualTransitions.add(toExperienceEvent(event, actualDelta));
             }
         }
+
+        // 第三步：关系状态应用成功后登记事件 Ledger。此处仍在当前事务内；
+        // 任一步失败都会整体回滚，Rabbit listener 不会 ACK 该批消息。
+        insertEventLedger(freshEvents);
 
         // 第四步：先按 target 聚合 +1/-1，再批量执行 CASE UPDATE，大幅减少同一目标的重复 SQL UPDATE 交互。
         updateTargetCounters(counterDeltas);
@@ -111,6 +130,35 @@ public class RedisLikePersistenceService {
         if (!actualTransitions.isEmpty()) {
             experienceService.processLikeEvents(actualTransitions);
         }
+    }
+
+    /**
+     * 批量关系应用前的扩展点。Redis Stream 模式无需额外准备；RabbitMQ 子类会在此处
+     * 对本批涉及的 pair-state 行按固定顺序加锁并恢复版本上下文。
+     */
+    protected void beforeApplyEvents(List<RedisLikeEvent> events) {
+        // Default implementation intentionally does nothing.
+    }
+
+    /**
+     * 应用一条事件后返回实际关系跃迁 delta 列表。
+     * Redis Stream 旧模式保留原有严格语义；RabbitMQ 子类覆盖此方法执行 pairVersion 判断。
+     *
+     * <p>默认实现：</p>
+     * - 调用 {@link #applyRelationState(RedisLikeEvent)} 执行关系表变更；
+     * - 若影响行数不为 1，说明 Redis 与 MySQL 状态不一致，抛异常让整个事务回滚，
+     *   事件保留在 Pending，等待人工/运维对账修复，避免把漏计数永久固化；
+     * - 返回单元素 delta 列表（来自事件自带的 delta，与 desiredState 严格对应）。
+     */
+    protected List<Integer> applyRelationStateDeltas(RedisLikeEvent event) {
+        int changedRows = applyRelationState(event);
+        if (changedRows != 1) {
+            throw new IllegalStateException("Redis/MySQL like projection mismatch: eventId=" + event.getEventId()
+                    + ", type=" + event.getTargetType() + ", targetId=" + event.getTargetId()
+                    + ", desiredState=" + event.getDesiredState() + ", userId=" + event.getUserId()
+                    + ", changedRows=" + changedRows);
+        }
+        return Collections.singletonList(event.deltaAsInt());
     }
 
     /**
@@ -268,15 +316,20 @@ public class RedisLikePersistenceService {
     }
 
     /**
-     * 将 RedisLikeEvent 转换为经验事件领域对象
+     * 将 RedisLikeEvent 转换为经验事件领域对象。
+     *
+     * <p>注意：delta 使用调用方传入的 {@code actualDelta}（本次事务内真实发生的关系跃迁），
+     * 不再使用事件自带的 {@code event.deltaAsInt()}。这是为了让 RabbitMQ 子类在
+     * STALE / DUPLICATE / ADVANCE_NOOP / 投影修复等场景下能准确反映真实跃迁，
+     * 避免把过期事件自带的 delta 当作计数依据。</p>
      */
-    private CommunityLikeOutboxEvent toExperienceEvent(RedisLikeEvent event) {
+    private CommunityLikeOutboxEvent toExperienceEvent(RedisLikeEvent event, int actualDelta) {
         CommunityLikeOutboxEvent converted = new CommunityLikeOutboxEvent();
         converted.setTargetType(event.getTargetType());
         converted.setTargetId(event.targetIdAsLong());
         converted.setActorUserId(event.userIdAsLong());
         converted.setOwnerUserId(event.ownerUserIdAsLongOrNull());
-        converted.setDelta(event.deltaAsInt());
+        converted.setDelta(actualDelta);
         converted.setCreateTime(new Date(event.createdAtAsLong()));
         converted.setStatus(CommunityLikeOutboxEvent.STATUS_PROCESSED);
         return converted;

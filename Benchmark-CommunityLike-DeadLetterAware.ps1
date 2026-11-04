@@ -11,6 +11,10 @@ param(
     [int]$Repetitions = 3,
     [int]$SampleIntervalSeconds = 2,
     [int]$DockerSampleIntervalSeconds = 5,
+    [string]$PrometheusBaseUrl = "http://localhost:9090",
+    [string]$PrometheusJob = "picture-backend",
+    [int]$PrometheusStepSeconds = 5,
+    [string]$DockerContext = "",
     [int]$BaselineSeconds = 15,
     [int]$DrainTimeoutSeconds = 300,
     [int]$DrainStableSamples = 5,
@@ -263,6 +267,159 @@ function Write-PrometheusSample {
     return (Convert-PrometheusTextToMap -Text $text)
 }
 
+
+function ConvertTo-PrometheusUnixSeconds {
+    param([Parameter(Mandatory = $true)][DateTime]$Timestamp)
+    $dto = [DateTimeOffset]$Timestamp
+    $seconds = [double]$dto.ToUnixTimeMilliseconds() / 1000.0
+    return $seconds.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Test-PrometheusServer {
+    param(
+        [string]$BaseUrl,
+        [string]$JobName
+    )
+
+    $query = 'up{job="' + $JobName.Replace('"', '\\"') + '"}'
+    $encoded = [Uri]::EscapeDataString($query)
+    $uri = "$($BaseUrl.TrimEnd('/'))/api/v1/query?query=$encoded"
+    try {
+        $response = Invoke-RestMethod -Method Get -Uri $uri -TimeoutSec 15
+    }
+    catch {
+        throw "Prometheus HTTP API 不可访问：$uri；$($_.Exception.Message)"
+    }
+    if ($response.status -ne "success" -or $null -eq $response.data -or $null -eq $response.data.result) {
+        throw "Prometheus 查询失败或返回结构不正确：$uri"
+    }
+    $targets = @($response.data.result)
+    if ($targets.Count -eq 0) {
+        throw "Prometheus 没有找到 job='$JobName' 的抓取目标。请检查 config/prometheus/prometheus.yml 和 /targets。"
+    }
+    $down = @($targets | Where-Object {
+        ($null -eq $_.value) -or ($_.value.Count -lt 2) -or ([string]$_.value[1] -ne "1")
+    })
+    if ($down.Count -gt 0) {
+        throw "Prometheus job='$JobName' 存在 DOWN 目标：$($down.Count) 个。请先打开 $($BaseUrl.TrimEnd('/'))/targets 检查错误。"
+    }
+    return [pscustomobject]@{
+        api_url = $BaseUrl.TrimEnd('/')
+        job = $JobName
+        target_count = $targets.Count
+        targets_up = $true
+    }
+}
+
+function Write-PrometheusRangeSamples {
+    param(
+        [string]$Phase,
+        [string]$RunId,
+        [string]$Mode,
+        [int]$Rate,
+        [int]$Repetition,
+        [DateTime]$StartTime,
+        [DateTime]$EndTime
+    )
+
+    if ($EndTime -le $StartTime) {
+        throw "Prometheus query_range 时间范围不合法：start=$StartTime end=$EndTime"
+    }
+
+    $selector = '{job="' + $script:PrometheusJob.Replace('"', '\\"') + '"}'
+    $encodedQuery = [Uri]::EscapeDataString($selector)
+    # Start one scrape step after the load marker so the first evaluation does not reuse a pre-load sample.
+    $queryStartTime = $StartTime.AddSeconds($script:PrometheusStepSeconds)
+    if ($queryStartTime -ge $EndTime) { $queryStartTime = $StartTime }
+    $startValue = ConvertTo-PrometheusUnixSeconds -Timestamp $queryStartTime
+    $endValue = ConvertTo-PrometheusUnixSeconds -Timestamp $EndTime
+    $step = [string]$script:PrometheusStepSeconds + 's'
+    $uri = "$($script:PrometheusBaseUrl)/api/v1/query_range?query=$encodedQuery&start=$startValue&end=$endValue&step=$step"
+
+    Write-Host "从 Prometheus TSDB 回取 $Phase 时序：step=$step，window=$startValue..$endValue" -ForegroundColor Cyan
+    try {
+        $response = Invoke-RestMethod -Method Get -Uri $uri -TimeoutSec 90
+    }
+    catch {
+        throw "Prometheus query_range 请求失败：$($_.Exception.Message)"
+    }
+    if ($response.status -ne "success" -or $null -eq $response.data -or $null -eq $response.data.result) {
+        $apiError = if ($response.error) { [string]$response.error } else { "未知 API 响应" }
+        throw "Prometheus query_range 返回错误：$apiError"
+    }
+
+    $csvPath = Join-Path $script:CurrentRunDir "prometheus-timeseries.csv"
+    $batch = New-Object 'System.Collections.Generic.List[object]'
+    $written = 0
+    $seriesCount = 0
+    foreach ($series in $response.data.result) {
+        $metricNameProperty = $series.metric.PSObject.Properties["__name__"]
+        if ($null -eq $metricNameProperty) { continue }
+        $metricName = [string]$metricNameProperty.Value
+        if ([string]::IsNullOrWhiteSpace($metricName)) { continue }
+        $seriesCount++
+
+        $labelPairs = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($labelProperty in ($series.metric.PSObject.Properties | Where-Object { $_.Name -ne "__name__" } | Sort-Object Name)) {
+            $labelValue = ([string]$labelProperty.Value).Replace('\\', '\\\\').Replace('"', '\\"')
+            $labelPairs.Add(($labelProperty.Name + '="' + $labelValue + '"'))
+        }
+        $labelsText = if ($labelPairs.Count -gt 0) { '{' + ($labelPairs -join ',') + '}' } else { $null }
+
+        foreach ($point in $series.values) {
+            if ($null -eq $point -or $point.Count -lt 2) { continue }
+            $epochSeconds = 0.0
+            if (-not [double]::TryParse([string]$point[0], [Globalization.NumberStyles]::Float,
+                    [Globalization.CultureInfo]::InvariantCulture, [ref]$epochSeconds)) { continue }
+            $epochMilliseconds = [long][math]::Round($epochSeconds * 1000.0)
+            $timestampUtc = [DateTimeOffset]::FromUnixTimeMilliseconds($epochMilliseconds).UtcDateTime.ToString("o")
+            $batch.Add([pscustomobject]@{
+                timestamp_utc = $timestampUtc
+                run_id = $RunId
+                phase = $Phase
+                mode = $Mode
+                target_rps = $Rate
+                repetition = $Repetition
+                metric_name = $metricName
+                labels = $labelsText
+                value = [string]$point[1]
+            })
+            if ($batch.Count -ge 2000) {
+                Write-CsvRows -Path $csvPath -Rows $batch.ToArray()
+                $written += $batch.Count
+                $batch.Clear()
+            }
+        }
+    }
+    if ($batch.Count -gt 0) {
+        Write-CsvRows -Path $csvPath -Rows $batch.ToArray()
+        $written += $batch.Count
+        $batch.Clear()
+    }
+
+    $rangeMeta = [pscustomobject]@{
+        status = "success"
+        phase = $Phase
+        run_id = $RunId
+        job = $script:PrometheusJob
+        selector = $selector
+        load_window_start_utc = ([DateTime]$StartTime).ToUniversalTime().ToString("o")
+        query_start_utc = ([DateTime]$queryStartTime).ToUniversalTime().ToString("o")
+        end_utc = ([DateTime]$EndTime).ToUniversalTime().ToString("o")
+        step_seconds = $script:PrometheusStepSeconds
+        series_count = $seriesCount
+        samples_written = $written
+        query_range_api = "$($script:PrometheusBaseUrl)/api/v1/query_range"
+    }
+    $metaPath = Join-Path $script:CurrentRunDir ("prometheus-query-range-{0}.json" -f $Phase)
+    $rangeMeta | ConvertTo-Json -Depth 6 | Set-Content -Path $metaPath -Encoding UTF8
+    if ($written -le 0) {
+        throw "Prometheus query_range 没有返回任何时序样本。请检查 job='$($script:PrometheusJob)'、时间范围、Prometheus 保留期和 /targets。"
+    }
+    Write-Host "Prometheus 回取完成：series=$seriesCount，samples=$written" -ForegroundColor Green
+    return $rangeMeta
+}
+
 function Get-PromValue {
     param(
         [hashtable]$MetricMap,
@@ -368,8 +525,21 @@ function Write-DockerStats {
     )
     if ($script:SkipDockerStats -or -not $script:DockerAvailable) { return }
     try {
-        $output = & $script:DockerExe stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}' 2>$null
-        if ($LASTEXITCODE -ne 0) { return }
+        $dockerArguments = @()
+        if (-not [string]::IsNullOrWhiteSpace($script:DockerContext)) {
+            $dockerArguments += @("--context", $script:DockerContext)
+        }
+        $dockerArguments += @("stats", "--no-stream", "--format", '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}')
+        $output = & $script:DockerExe @dockerArguments 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-CsvRow -Path (Join-Path $script:CurrentRunDir "docker-stats-errors.csv") -Row ([pscustomobject]@{
+                timestamp_utc = [DateTime]::UtcNow.ToString("o")
+                phase = $Phase
+                error = (($output | Out-String).Trim())
+                docker_context = $script:DockerContext
+            })
+            return
+        }
         $timestamp = [DateTime]::UtcNow.ToString("o")
         foreach ($line in $output) {
             $parts = ([string]$line).Split('|')
@@ -382,6 +552,7 @@ function Write-DockerStats {
                 target_rps = $Rate
                 repetition = $Repetition
                 container = $parts[0]
+                docker_context = $script:DockerContext
                 cpu_percent = $parts[1]
                 memory_usage = $parts[2]
                 memory_percent = $parts[3]
@@ -402,7 +573,13 @@ function Capture-TelemetrySample {
         [int]$Repetition,
         [int]$K6ProcessId = 0
     )
-    $map = Write-PrometheusSample -Phase $Phase -RunId $RunId -Mode $Mode -Rate $Rate -Repetition $Repetition
+    # During baseline/setup/load, application metrics are taken from Prometheus TSDB
+    # after the interval. Do not repeatedly scrape the full Actuator endpoint from this
+    # controller loop: that creates avoidable load and makes the loop drift beyond its interval.
+    $map = $null
+    if ($Phase -notin @("baseline", "setup", "load")) {
+        $map = Write-PrometheusSample -Phase $Phase -RunId $RunId -Mode $Mode -Rate $Rate -Repetition $Repetition
+    }
     Write-HostSample -Phase $Phase -RunId $RunId -Mode $Mode -Rate $Rate -Repetition $Repetition -K6ProcessId $K6ProcessId
     $now = [DateTime]::UtcNow
     $shouldDocker = $true
@@ -542,17 +719,60 @@ function Get-MetricSummary {
         [string]$Suffix
     )
     if (-not (Test-Path $Path)) { return $null }
-    $rows = @(Import-Csv $Path | Where-Object { $_.phase -eq "load" -and $_.metric_name -eq $MetricName })
-    if ($rows.Count -eq 0) { return $null }
-    $numbers = @($rows | ForEach-Object {
-        $d = 0.0
-        if ([double]::TryParse($_.value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { $d }
-    })
-    if ($numbers.Count -eq 0) { return $null }
-    if ($Suffix -eq "avg") { return [math]::Round(($numbers | Measure-Object -Average).Average, 3) }
-    if ($Suffix -eq "max") { return [math]::Round(($numbers | Measure-Object -Maximum).Maximum, 3) }
-    if ($Suffix -eq "min") { return [math]::Round(($numbers | Measure-Object -Minimum).Minimum, 3) }
-    return $null
+
+    # Parse each run's large CSV once, then reuse the aggregate for every metric summary field.
+    $cacheVariable = Get-Variable -Name LoadMetricSummaryCache -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $cacheVariable) { $script:LoadMetricSummaryCache = @{} }
+
+    if (-not $script:LoadMetricSummaryCache.ContainsKey($Path)) {
+        $trackedMetrics = @(
+            "community_like_rabbitmq_relay_stream_entries",
+            "community_like_rabbitmq_relay_stream_pending",
+            "community_like_rabbitmq_queue_depth",
+            "community_like_rabbitmq_consumer_inflight",
+            "community_like_rabbitmq_retry_depth",
+            "community_like_rabbitmq_dead_depth"
+        )
+        $stats = @{}
+        foreach ($name in $trackedMetrics) {
+            $stats[$name] = @{ sum = 0.0; count = 0; min = [double]::PositiveInfinity; max = [double]::NegativeInfinity }
+        }
+
+        Import-Csv -Path $Path | ForEach-Object {
+            if ($_.phase -eq "load" -and $stats.ContainsKey($_.metric_name)) {
+                $parsed = 0.0
+                if ([double]::TryParse(
+                        $_.value,
+                        [Globalization.NumberStyles]::Float,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [ref]$parsed)) {
+                    $stat = $stats[$_.metric_name]
+                    $stat.sum += $parsed
+                    $stat.count++
+                    if ($parsed -lt $stat.min) { $stat.min = $parsed }
+                    if ($parsed -gt $stat.max) { $stat.max = $parsed }
+                }
+            }
+        }
+
+        $aggregated = @{}
+        foreach ($name in $trackedMetrics) {
+            $stat = $stats[$name]
+            if ($stat.count -gt 0) {
+                $aggregated[$name] = @{
+                    avg = [math]::Round(($stat.sum / $stat.count), 3)
+                    min = [math]::Round($stat.min, 3)
+                    max = [math]::Round($stat.max, 3)
+                }
+            }
+        }
+        $script:LoadMetricSummaryCache[$Path] = $aggregated
+    }
+
+    $pathSummary = $script:LoadMetricSummaryCache[$Path]
+    if (-not $pathSummary.ContainsKey($MetricName)) { return $null }
+    if (-not $pathSummary[$MetricName].ContainsKey($Suffix)) { return $null }
+    return $pathSummary[$MetricName][$Suffix]
 }
 
 function Get-CounterDelta {
@@ -565,6 +785,54 @@ function Get-CounterDelta {
     $b = Get-PromValue -MetricMap $After -MetricName $MetricName
     if ($null -eq $a -or $null -eq $b) { return $null }
     return [math]::Round(($b - $a), 3)
+}
+
+
+function Get-K6ThresholdSummary {
+    param([object]$Summary)
+
+    $metrics = Get-ObjectPropertyValue -Object $Summary -Name "metrics"
+    if ($null -eq $metrics) {
+        return [pscustomobject]@{
+            present = $false
+            failed = $null
+            failed_count = $null
+            failed_names = $null
+            threshold_count = 0
+        }
+    }
+
+    $thresholdCount = 0
+    $failedNames = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($metricProperty in $metrics.PSObject.Properties) {
+        $thresholds = Get-ObjectPropertyValue -Object $metricProperty.Value -Name "thresholds"
+        if ($null -eq $thresholds) { continue }
+        foreach ($thresholdProperty in $thresholds.PSObject.Properties) {
+            $thresholdCount++
+            # In k6 summary JSON, true means the threshold failed; false means it passed.
+            if ([bool]$thresholdProperty.Value) {
+                $failedNames.Add("$($metricProperty.Name):$($thresholdProperty.Name)")
+            }
+        }
+    }
+
+    if ($thresholdCount -eq 0) {
+        return [pscustomobject]@{
+            present = $false
+            failed = $null
+            failed_count = $null
+            failed_names = $null
+            threshold_count = 0
+        }
+    }
+
+    return [pscustomobject]@{
+        present = $true
+        failed = ($failedNames.Count -gt 0)
+        failed_count = $failedNames.Count
+        failed_names = ($failedNames -join ";")
+        threshold_count = $thresholdCount
+    }
 }
 
 function Get-K6SummaryFields {
@@ -621,9 +889,35 @@ function Get-K6SummaryFields {
     $businessFailureRate = Get-SummaryValue -Summary $summary -MetricNames @("business_failures") -ValueName "value"
     $businessFailureCount = Get-SummaryValue -Summary $summary -MetricNames @("business_failures") -ValueName "passes"
     $dropped = Get-SummaryValue -Summary $summary -MetricNames @("dropped_iterations") -ValueName "count"
+    $thresholdSummary = Get-K6ThresholdSummary -Summary $summary
+    $successfulHttpRequests = $null
+    $successfulBusinessRequests = $null
+    $successfulHttpRps = $null
+    $successfulBusinessRps = $null
+    if ($null -ne $requestCount -and $null -ne $httpFailureRate) {
+        $successfulHttpRequests = [math]::Round(([double]$requestCount * (1.0 - [double]$httpFailureRate)), 3)
+        if ($durationSeconds -gt 0) {
+            $successfulHttpRps = [math]::Round(($successfulHttpRequests / $durationSeconds), 3)
+        }
+    }
+    if ($null -ne $requestCount -and $null -ne $businessFailureRate) {
+        $successfulBusinessRequests = [math]::Round(([double]$requestCount * (1.0 - [double]$businessFailureRate)), 3)
+        if ($durationSeconds -gt 0) {
+            $successfulBusinessRps = [math]::Round(($successfulBusinessRequests / $durationSeconds), 3)
+        }
+    }
 
     return [pscustomobject]@{
         actual_rps = $actualRps
+        successful_http_requests = $successfulHttpRequests
+        successful_http_rps = $successfulHttpRps
+        successful_business_requests = $successfulBusinessRequests
+        successful_business_rps = $successfulBusinessRps
+        thresholds_present = $thresholdSummary.present
+        thresholds_failed = $thresholdSummary.failed
+        thresholds_failed_count = $thresholdSummary.failed_count
+        thresholds_failed_names = $thresholdSummary.failed_names
+        thresholds_count = $thresholdSummary.threshold_count
         actual_rps_metric = "iterations.count / configured_load_duration_seconds"
         like_http_requests = $requestCount
         like_http_requests_metric = $requestCountSource
@@ -662,8 +956,9 @@ function Get-K6FallbackExitCode {
         [string]$StderrPath
     )
 
-    # 只有 k6 输出完整汇总且 summary 包含所有阈值指标时才推断退出码。
-    # stdout/stderr 都检查，避免不同启动方式导致汇总文本落在不同流中。
+    # Exit-code inference is deliberately conservative: require a summary and
+    # a completed TOTAL RESULTS section. Threshold status comes from summary JSON,
+    # not from a guessed native exit code or a console-text regex.
     if (-not (Test-Path $SummaryPath)) { return $null }
 
     $completeResultsFound = $false
@@ -682,25 +977,9 @@ function Get-K6FallbackExitCode {
 
     try {
         $summary = Get-Content -Raw -Path $SummaryPath | ConvertFrom-Json
-        $businessRate = Get-SummaryValue -Summary $summary -MetricNames @("business_failures") -ValueName "value"
-        $httpFailureRate = Get-SummaryValue -Summary $summary -MetricNames @("http_req_failed{name:like_toggle}", "http_req_failed") -ValueName "value"
-        $dropped = Get-SummaryValue -Summary $summary -MetricNames @("dropped_iterations") -ValueName "count"
-        $p95 = Get-SummaryValue -Summary $summary -MetricNames @("http_req_duration{name:like_toggle}", "http_req_duration") -ValueName "p(95)"
-        $p99 = Get-SummaryValue -Summary $summary -MetricNames @("http_req_duration{name:like_toggle}", "http_req_duration") -ValueName "p(99)"
-
-        if ($null -eq $businessRate -or $null -eq $httpFailureRate -or
-            $null -eq $dropped -or $null -eq $p95 -or $null -eq $p99) {
-            return $null
-        }
-
-        # Keep these values aligned with community_like_mq_benchmark.js.
-        $failed = ([double]$businessRate -ge 0.01) -or
-                  ([double]$httpFailureRate -ge 0.01) -or
-                  ([double]$dropped -gt 0) -or
-                  ([double]$p95 -ge 500.0) -or
-                  ([double]$p99 -ge 1000.0)
-
-        if ($failed) { return 99 }
+        $thresholdSummary = Get-K6ThresholdSummary -Summary $summary
+        if (-not $thresholdSummary.present -or $null -eq $thresholdSummary.failed) { return $null }
+        if ($thresholdSummary.failed) { return 99 }
         return 0
     }
     catch {
@@ -961,6 +1240,10 @@ $script:ProjectPath = (Resolve-Path $ProjectPath).Path
 Push-Location -LiteralPath $script:ProjectPath
 $script:LocationPushed = $true
 $script:BaseUrl = $BaseUrl
+$script:PrometheusBaseUrl = $PrometheusBaseUrl.TrimEnd('/')
+$script:PrometheusJob = $PrometheusJob
+$script:PrometheusStepSeconds = $PrometheusStepSeconds
+$script:DockerContext = $DockerContext
 $script:DrainTimeoutSeconds = $DrainTimeoutSeconds
 $script:DrainStableSamples = $DrainStableSamples
 $script:DrainPollSeconds = $DrainPollSeconds
@@ -973,6 +1256,8 @@ $script:LastDockerSampleUtc = $null
 if ($Repetitions -lt 1) { throw "Repetitions 必须大于等于 1。" }
 if ($SampleIntervalSeconds -lt 1) { throw "SampleIntervalSeconds 不能小于 1。" }
 if ($DockerSampleIntervalSeconds -lt 1) { throw "DockerSampleIntervalSeconds 必须大于等于 1。" }
+if ($PrometheusStepSeconds -lt 1) { throw "PrometheusStepSeconds 必须大于等于 1。" }
+if ([string]::IsNullOrWhiteSpace($PrometheusJob)) { throw "PrometheusJob 不能为空。" }
 if ($BaselineSeconds -lt 0) { throw "BaselineSeconds 不能小于 0。" }
 if ($DrainTimeoutSeconds -lt 1) { throw "DrainTimeoutSeconds 必须大于等于 1。" }
 if ($DrainStableSamples -lt 1) { throw "DrainStableSamples 必须大于等于 1。" }
@@ -1095,7 +1380,10 @@ $javaVersion = Get-CommandVersionText -Command "java" -Arguments @("-version")
 $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
 $script:DockerAvailable = [bool]$dockerCommand
 $script:DockerExe = if ($dockerCommand) { $dockerCommand.Source } else { $null }
-$dockerVersion = if ($script:DockerAvailable) { Get-CommandVersionText -Command $script:DockerExe -Arguments @("version", "--format", "{{.Server.Version}}") } else { "not_available" }
+$dockerVersionArguments = @()
+if (-not [string]::IsNullOrWhiteSpace($script:DockerContext)) { $dockerVersionArguments += @("--context", $script:DockerContext) }
+$dockerVersionArguments += @("version", "--format", "{{.Server.Version}}")
+$dockerVersion = if ($script:DockerAvailable) { Get-CommandVersionText -Command $script:DockerExe -Arguments $dockerVersionArguments } else { "not_available" }
 
 $script:K6Cores = $K6Cores
 $script:SkipCpuAffinity = [bool]$SkipCpuAffinity
@@ -1112,6 +1400,7 @@ if (-not $SkipCpuAffinity) {
 }
 
 $preflight = Test-ApiPreflight
+$prometheusPreflight = Test-PrometheusServer -BaseUrl $script:PrometheusBaseUrl -JobName $script:PrometheusJob
 $seed = if ($RandomSeed -gt 0) { $RandomSeed } else { Get-Random -Minimum 100000 -Maximum 2147483000 }
 $rng = [System.Random]::new([int]$seed)
 
@@ -1127,6 +1416,11 @@ $manifest = [pscustomobject]@{
     load_generator_java_pid = $script:JavaPid
     application_base_url = $BaseUrl
     actuator_health = $preflight
+    prometheus_server = $prometheusPreflight
+    prometheus_base_url = $script:PrometheusBaseUrl
+    prometheus_job = $script:PrometheusJob
+    prometheus_range_step_seconds = $PrometheusStepSeconds
+    docker_context = $DockerContext
     k6_script_relative_path = $K6Script
     k6_script_sha256 = Get-Sha256 -Path $scriptFile
     users_file_sha256 = Get-Sha256 -Path $usersPath
@@ -1158,7 +1452,7 @@ $manifest = [pscustomobject]@{
     notes = @(
         "Target RPS is an arrival-rate target, not a guaranteed achieved RPS.",
         "Compare modes on the same hardware/software/configuration; do not claim this local RPS as universal capacity.",
-        "Prometheus captures all Actuator metrics, including JVM/process/system, RabbitMQ, consumer, and datasource metrics when exposed.",
+        "Prometheus application metrics are recovered from TSDB query_range after each run; set Prometheus scrape interval and query step to the same value.",
         "Host CPU/memory fields describe the machine running this PowerShell/k6 script; backend system CPU can be read from system_cpu_usage in Prometheus if Micrometer exposes it."
     )
 }
@@ -1184,10 +1478,21 @@ $script:PreviousProcessSamples = @{}
 $script:LastDockerSampleUtc = $null
 Write-Host "采集压测前基线：${BaselineSeconds}s ..." -ForegroundColor Cyan
 $baselineStart = Get-Date
+$baselineStartUtc = [DateTime]::UtcNow
+$nextBaselineSample = Get-Date
 while (((Get-Date) - $baselineStart).TotalSeconds -lt $BaselineSeconds) {
-    Capture-TelemetrySample -Phase "baseline" -RunId "BASELINE" -Mode "none" -Rate 0 -Repetition 0 -K6ProcessId 0 | Out-Null
-    Start-Sleep -Seconds $SampleIntervalSeconds
+    $now = Get-Date
+    if ($now -ge $nextBaselineSample) {
+        Capture-TelemetrySample -Phase "baseline" -RunId "BASELINE" -Mode "none" -Rate 0 -Repetition 0 -K6ProcessId 0 | Out-Null
+        $nextBaselineSample = $nextBaselineSample.AddSeconds($SampleIntervalSeconds)
+        if ($nextBaselineSample -le (Get-Date)) { $nextBaselineSample = (Get-Date).AddSeconds($SampleIntervalSeconds) }
+    }
+    Start-Sleep -Milliseconds 200
 }
+$baselineEndUtc = [DateTime]::UtcNow
+$script:CurrentRunDir = $baselineDir
+$baselineRange = Write-PrometheusRangeSamples -Phase "baseline" -RunId "BASELINE" -Mode "none" -Rate 0 -Repetition 0 `
+    -StartTime $baselineStartUtc -EndTime $baselineEndUtc
 
 # ------------------------------
 # Execute randomized benchmark matrix
@@ -1284,6 +1589,15 @@ try {
 
             $k6Summary = [pscustomobject]@{
                 actual_rps = $null
+                successful_http_requests = $null
+                successful_http_rps = $null
+                successful_business_requests = $null
+                successful_business_rps = $null
+                thresholds_present = $false
+                thresholds_failed = $null
+                thresholds_failed_count = $null
+                thresholds_failed_names = $null
+                thresholds_count = 0
                 actual_rps_metric = "unavailable: summary missing or invalid"
                 like_http_requests = $null
                 like_http_requests_metric = "unavailable"
@@ -1322,24 +1636,31 @@ try {
             }
 
             $lastMarkerScan = [DateTime]::MinValue
+            $nextHostSample = Get-Date
             try {
                 while ($true) {
                     $process.Refresh()
                     $now = Get-Date
-                    if (-not $loadMarkerSeen -and (($now - $lastMarkerScan).TotalSeconds -ge 1)) {
+                    if (-not $loadMarkerSeen -and (($now - $lastMarkerScan).TotalMilliseconds -ge 250)) {
                         $lastMarkerScan = $now
                         # k6 console.log is written to stderr in some environments;
-                        # inspect both redirected streams.
+                        # inspect both redirected streams with a short detection interval.
                         if (Test-LoadMarkerInLogs -Paths @($stdoutPath, $stderrPath)) {
                             $loadMarkerSeen = $true
                             $loadStartedAt = $now
-                            Write-Host "检测到 k6 正式负载开始标记，后续 Prometheus/主机采样归入 load 阶段。" -ForegroundColor Cyan
+                            Write-Host "检测到 k6 正式负载开始标记；应用指标将从 Prometheus TSDB 回取，主机指标按设定间隔采集。" -ForegroundColor Cyan
                         }
                     }
                     if ($process.HasExited) { break }
-                    $samplePhase = if ($loadMarkerSeen) { "load" } else { "setup" }
-                    Capture-TelemetrySample -Phase $samplePhase -RunId $runId -Mode $mode -Rate $rate -Repetition $rep -K6ProcessId $processId | Out-Null
-                    Start-Sleep -Seconds $SampleIntervalSeconds
+                    if ($now -ge $nextHostSample) {
+                        $samplePhase = if ($loadMarkerSeen) { "load" } else { "setup" }
+                        Capture-TelemetrySample -Phase $samplePhase -RunId $runId -Mode $mode -Rate $rate -Repetition $rep -K6ProcessId $processId | Out-Null
+                        $nextHostSample = $nextHostSample.AddSeconds($SampleIntervalSeconds)
+                        if ($nextHostSample -le (Get-Date)) {
+                            $nextHostSample = (Get-Date).AddSeconds($SampleIntervalSeconds)
+                        }
+                    }
+                    Start-Sleep -Milliseconds 200
                 }
             }
             catch {
@@ -1499,6 +1820,23 @@ try {
             $afterDrainMap = $drain.after_metrics
             $drainEndUtc = [DateTime]::UtcNow
 
+            $prometheusRangeError = $null
+            $prometheusRangeSummary = $null
+            if ($loadMarkerSeen -and $null -ne $loadStartedAt) {
+                try {
+                    $prometheusRangeSummary = Write-PrometheusRangeSamples -Phase "load" -RunId $runId -Mode $mode -Rate $rate -Repetition $rep `
+                        -StartTime $loadStartedAt -EndTime $endTime
+                }
+                catch {
+                    $prometheusRangeError = $_.Exception.Message
+                    Write-Warning "Prometheus 历史时序回取失败：$prometheusRangeError"
+                }
+            }
+            else {
+                $prometheusRangeError = "未检测到 BENCHMARK_LOAD_STARTED，无法准确确定 Prometheus 负载查询窗口。"
+                Write-Warning $prometheusRangeError
+            }
+
             $deadLetterPublishedDelta = Get-CounterDelta -Before $beforeMap -After $afterDrainMap -MetricName "community_like_rabbitmq_dead_letter_published_total"
             $deadLetterAuditPersistedDelta = Get-CounterDelta -Before $beforeMap -After $afterDrainMap -MetricName "community_like_rabbitmq_dead_letter_audit_persisted_total"
             $deadLetterAuditFailuresDelta = Get-CounterDelta -Before $beforeMap -After $afterDrainMap -MetricName "community_like_rabbitmq_dead_letter_audit_failures_total"
@@ -1541,17 +1879,33 @@ try {
                 load_marker_seen = $loadMarkerSeen
                 monitoring_error = $runProcessingError
                 postload_capture_error = $postloadCaptureError
+                prometheus_range_error = $prometheusRangeError
+                prometheus_range_series_count = if ($prometheusRangeSummary) { $prometheusRangeSummary.series_count } else { $null }
+                prometheus_range_samples_written = if ($prometheusRangeSummary) { $prometheusRangeSummary.samples_written } else { $null }
+                prometheus_range_step_seconds = $PrometheusStepSeconds
+                prometheus_range_start_utc = if ($loadStartedAt) { $loadStartedAt.ToUniversalTime().ToString("o") } else { $null }
+                prometheus_range_end_utc = if ($endTime) { $endTime.ToUniversalTime().ToString("o") } else { $null }
                 summary_error = $summaryError
                 exit_code_read_error = $exitCodeReadError
                 drain_error = $drainError
                 k6_exit_code = $exitCode
                 k6_exit_code_inferred = $exitCodeInferred
-                k6_thresholds_failed = ($exitCode -eq 99)
+                k6_thresholds_present = $k6Summary.thresholds_present
+                k6_thresholds_failed = $k6Summary.thresholds_failed
+                k6_thresholds_failed_count = $k6Summary.thresholds_failed_count
+                k6_thresholds_failed_names = $k6Summary.thresholds_failed_names
+                k6_thresholds_count = $k6Summary.thresholds_count
+                k6_thresholds_passed = if ($null -ne $k6Summary.thresholds_failed) { -not [bool]$k6Summary.thresholds_failed } else { $null }
                 k6_summary_exists = (Test-Path $summaryPath)
                 drain_success = $drain.success
                 drain_reason = $drain.reason
                 drain_seconds_to_stable_zero = $drain.seconds
                 actual_rps = $k6Summary.actual_rps
+                successful_http_requests = $k6Summary.successful_http_requests
+                successful_http_rps = $k6Summary.successful_http_rps
+                successful_business_requests = $k6Summary.successful_business_requests
+                successful_business_rps = $k6Summary.successful_business_rps
+                target_rate_achieved_ratio = if ($rate -gt 0 -and $null -ne $k6Summary.actual_rps) { [math]::Round(([double]$k6Summary.actual_rps / [double]$rate), 4) } else { $null }
                 actual_rps_metric = $k6Summary.actual_rps_metric
                 like_http_requests = $k6Summary.like_http_requests
                 like_http_requests_metric = $k6Summary.like_http_requests_metric
@@ -1603,6 +1957,9 @@ try {
             if ($postloadCaptureError) {
                 throw "本轮 postload 指标采集异常，结果不纳入有效基线：$postloadCaptureError"
             }
+            if ($prometheusRangeError) {
+                throw "本轮 Prometheus query_range 数据不完整，结果不纳入有效基线：$prometheusRangeError"
+            }
             if ($summaryError) {
                 throw "本轮 k6 summary 无效，结果不纳入有效基线：$summaryError"
             }
@@ -1618,8 +1975,12 @@ try {
             if ($deadLetterPublishedDelta -gt 0 -or $deadLetterAuditFailuresDelta -gt 0) {
                 throw "本轮虽然完成排空，但产生死信/审计失败：published=$deadLetterPublishedDelta, auditFailures=$deadLetterAuditFailuresDelta。该轮标记为异常并停止后续矩阵：$runId"
             }
-            Write-Host ("完成 {0}: actualRPS={1}, p95={2}ms, businessFail={3}, dropped={4}, drain={5}s" -f `
-                $runId, $k6Summary.actual_rps, $k6Summary.http_req_duration_p95_ms, $k6Summary.business_failure_rate, $k6Summary.dropped_iterations, $drain.seconds) -ForegroundColor Green
+            $thresholdLabel = if ($null -eq $k6Summary.thresholds_failed) { "THRESHOLD_UNKNOWN" } elseif ($k6Summary.thresholds_failed) { "THRESHOLD_FAILED" } else { "THRESHOLD_PASS" }
+            $thresholdColor = if ($k6Summary.thresholds_failed -eq $true) { "Yellow" } else { "Green" }
+            Write-Host ("完成 {0}: status={1}, actualRPS={2}, successfulHttpRPS={3}, p95={4}ms, p99={5}ms, businessFail={6}, dropped={7}, promSamples={8}, drain={9}s" -f `
+                $runId, $thresholdLabel, $k6Summary.actual_rps, $k6Summary.successful_http_rps, $k6Summary.http_req_duration_p95_ms, `
+                $k6Summary.http_req_duration_p99_ms, $k6Summary.business_failure_rate, $k6Summary.dropped_iterations, `
+                $prometheusRangeSummary.samples_written, $drain.seconds) -ForegroundColor $thresholdColor
             if ($CooldownSeconds -gt 0) { Start-Sleep -Seconds $CooldownSeconds }
         }
     }
@@ -1665,25 +2026,25 @@ Community Like Benchmark Results
 This archive contains comparative measurements for single / multi / mixed target distributions.
 
 Key files:
-- manifest.json: test configuration, machine, software versions, Git commit, hashes of local input files.
+- manifest.json: test configuration, machine, software versions, Git commit, hashes of local input files, Prometheus job/step, and Docker context.
 - run-index.csv: one row per test round; compare actual_rps, p95/p99, failures, dropped iterations, consumer deltas, backlog and drain time.
 - k6-metrics.csv: all k6 summary metric values for each run.
 - baseline/: idle host and Actuator Prometheus baseline samples.
-- Rxx-.../: per-run k6 summary/logs, full Prometheus time series, Windows host samples, Docker stats and drain-check records.
+- Rxx-.../: per-run k6 summary/logs, Prometheus query_range time series, Windows host samples, Docker stats and drain-check records.
 - completion.json: whether all runs completed or the matrix stopped early.
 - emergency-cleanup.json: best-effort stop/drain record when a run exits unexpectedly.
 - application-logs/backend-app.log: optional copy of the Spring Boot log if -AppLogPath was supplied.
 
 Important interpretation rules:
-1. target_rps is the scheduled arrival rate. Use actual_rps and dropped_iterations to judge whether k6 achieved it. P99 is exported explicitly via --summary-trend-stats.
-2. The benchmark k6 copy emits BENCHMARK_LOAD_STARTED on its first actual load iteration. Prometheus/host samples before that marker are phase=setup (the 400 account logins); samples after it are phase=load.
+1. target_rps is the scheduled arrival rate. Use actual_rps, successful_http_rps, successful_business_rps and dropped_iterations to judge the achieved load. P99 is exported explicitly via --summary-trend-stats. k6 threshold failures are read from summary.metrics.*.thresholds, not inferred from the process exit code alone.
+2. The benchmark k6 copy emits BENCHMARK_LOAD_STARTED on its first actual load iteration. Windows host samples before that marker are phase=setup and after it are phase=load. Application metrics are exported after the run from Prometheus TSDB query_range using the actual load-marker/end timestamps; the query step should match the Prometheus scrape interval.
 3. Prefer http_req_duration{name:like_toggle} for API latency. If absent, the index falls back to aggregate http_req_duration and marks the actual-RPS source similarly; this fallback may include setup/login requests.
 4. The k6 API latency is request acceptance latency, not MySQL persistence latency. Use consumer_messages_delta, RabbitMQ queue/Stream gauges, batch duration metrics, and drain time to analyze asynchronous persistence.
 5. A non-empty dead queue, non-zero failures/retries, or business failure rate is a reliability signal, not just a performance number.
 6. Results are relative comparisons under this exact hardware/software configuration. Do not present the measured RPS as a universal server capacity claim.
 7. users.local.json and targets.local.json are intentionally not included. Their SHA-256 hashes are in manifest.json so the local test inputs can be identified without exposing credentials or target IDs.
-8. Prometheus metric samples include every numeric metric exposed by /actuator/prometheus, including JVM, process/system CPU, datasource, RabbitMQ and custom consumer metrics when enabled.
-9. host-timeseries.csv describes the Windows machine running this script/k6. If backend is on another host, use system_cpu_usage / process_cpu_usage in Prometheus for backend CPU where available.
+8. Prometheus query_range samples include every time series scraped under job=picture-backend, including JVM, process/system CPU, datasource, Spring RabbitMQ, and custom consumer metrics when exposed. query_range retrieves historical samples and does not repeatedly scrape Actuator from the load-controller loop.
+9. host-timeseries.csv describes the Windows machine running this script/k6. If backend is on another host, use system_cpu_usage / process_cpu_usage in Prometheus for backend CPU where available. Docker stats use the selected Docker context; configure -DockerContext to sample the VM Docker Engine over a secure SSH Docker context when applicable.
 
 The ZIP is intended to be sent back for analysis. Do not add users.local.json, passwords, session cookies, database dumps or production data. If an application log was copied, inspect it for secrets before sharing.
 "@ | Set-Content -Path $readmePath -Encoding UTF8

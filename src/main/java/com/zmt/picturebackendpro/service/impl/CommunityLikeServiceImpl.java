@@ -50,7 +50,6 @@ public class CommunityLikeServiceImpl implements CommunityLikeService {
         if (loginUser.getId().equals(post.getUserId())) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "不能给自己的帖子点赞");
         }
-
         CommunityPostLike like = new CommunityPostLike();
         like.setPostId(postId);
         like.setUserId(loginUser.getId());
